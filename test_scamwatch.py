@@ -325,7 +325,7 @@ class TestCtRefinement(unittest.TestCase):
             self.rows = rows
 
         def get(self, url, params=None, timeout=None, **kw):
-            rows, outer = self.rows, self
+            rows = self.rows
 
             class R:
                 status_code = 200

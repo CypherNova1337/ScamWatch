@@ -139,6 +139,11 @@ Keys worth knowing:
   cheap; highest-yield first, since the circuit breaker may cut a pass short
 - `ct_keywords`, `brand_shortcodes` — local refinement, matched against
   hostnames a broad query already returned. Never sent to crt.sh directly
+- `ct_require_refine` — default `true`: a hostname must match one of the
+  refinement keywords to become a candidate. Broad terms bring noise with them
+  (`%defender%` returns Land Rover dealerships), and this is what keeps the
+  results specific. `--limit` counts domains kept, not rows scanned, so this
+  costs no recall
 - `urlscan_queries` — `[label, query]` pairs, kit signatures
 - `feed_urls` — `[label, url]` pairs of keyless phishing feeds
 - `feed_min_interval` — seconds between feed re-downloads (default 3600). The

@@ -38,7 +38,7 @@ import time
 from dataclasses import dataclass, field
 from email.message import EmailMessage
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -1152,9 +1152,9 @@ def attribute(sess: requests.Session, domain: str, fp: Fingerprint,
     att.registrar, att.registrar_abuse = registrar_from_rdap(data)
     if not att.registrar_abuse:
         haystack = att.registrar.lower()
-        for key, email in cfg["registrar_abuse"].items():
+        for key, addr in cfg["registrar_abuse"].items():
             if key in haystack:
-                att.registrar_abuse = email
+                att.registrar_abuse = addr
                 break
 
     for event in data.get("events", []) or []:
@@ -1167,9 +1167,9 @@ def attribute(sess: requests.Session, domain: str, fp: Fingerprint,
             att.nameservers.append(str(ns["ldhName"]).lower())
 
     # free hosts are identifiable from the name alone
-    for host, email in cfg["host_abuse"].items():
+    for host, addr in cfg["host_abuse"].items():
         if host in domain:
-            att.host_org, att.host_abuse = host, email
+            att.host_org, att.host_abuse = host, addr
             break
 
     if not att.host_abuse:
@@ -1178,9 +1178,9 @@ def attribute(sess: requests.Session, domain: str, fp: Fingerprint,
         att.host_abuse = abuse_email
         if not att.host_abuse and org:
             lowered = org.lower()
-            for host, email in cfg["host_abuse"].items():
+            for host, addr in cfg["host_abuse"].items():
                 if host in lowered:
-                    att.host_abuse = email
+                    att.host_abuse = addr
                     break
     return att
 
