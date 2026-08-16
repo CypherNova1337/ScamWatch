@@ -54,6 +54,9 @@ UA = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) scamwatch/{VERSION} (+abuse-int
 MAX_BODY_BYTES = 2_000_000
 # Consecutive crt.sh failures after which the rest of the pass gives up on it.
 CT_FAILURE_LIMIT = 5
+# A marker at or above this weight is "strong": it describes something only a
+# scam page does, rather than vocabulary a legitimate security page also uses.
+STRONG_MARKER_MIN_WEIGHT = 3
 # Politeness delay between queries to a shared public service.
 CT_QUERY_DELAY = 1.0
 
@@ -92,15 +95,37 @@ DEFAULT_CONFIG: Dict = {
         "anz-", "nab-", "westpac-", "lloyds-", "santander-", "scotiabank-",
         "kiwibank-", "revolut-", "-anz", "-nab", "-westpac",
     ],
+    # Every query is automatically constrained to urlscan_max_age_days unless
+    # it already carries its own date: filter. Without that constraint the
+    # index happily returns scans from 2024, and these pages live for hours.
+    #
+    # Queries must carry real signal. A bare page.url:"support" filter was
+    # tried and matched, among other things, a German Minecraft donation page
+    # - "support" in a URL means nothing on its own.
     "urlscan_queries": [
         ["killer_cluster", 'filename:"config.js" AND page.url:"supabase.co"'],
         ["killer_anz", 'page.url:"/anz/" AND page.url:"index.html"'],
-        ["live_support", 'page.title:"live support" AND (page.url:"anydesk" OR page.url:"teamviewer")'],
-        ["netlify_fake", 'page.domain:"netlify.app" AND page.url:"support"'],
-        ["pages_dev_fake", 'page.domain:"pages.dev" AND page.url:"support"'],
-        ["vercel_fake", 'page.domain:"vercel.app" AND page.url:"support"'],
         ["remote_tool", 'page.url:"anydesk" OR page.url:"teamviewer" OR page.url:"screenconnect"'],
+        ["remote_tool_brand",
+         '(page.url:"anydesk" OR page.url:"teamviewer") AND '
+         '(page.url:"bank" OR page.url:"support" OR page.url:"secure")'],
+        ["free_host_remote_tool",
+         '(page.domain:"netlify.app" OR page.domain:"pages.dev" OR '
+         'page.domain:"vercel.app") AND '
+         '(page.url:"anydesk" OR page.url:"teamviewer" OR page.url:"defender")'],
+        ["fake_alert_title",
+         'page.title:"virus" OR page.title:"windows defender" OR '
+         'page.title:"security alert"'],
     ],
+    # Scans older than this are ignored. These pages are usually gone within a
+    # day: of 14 urlscan hits fetched during testing, 10 returned a hosting
+    # "site not found" stub, and the two freshest and most on-target - scanned
+    # the previous day - were already 503/unreachable.
+    "urlscan_max_age_days": 7,
+    # When the live page is gone, score urlscan's saved DOM instead. This is
+    # what makes the tool work at all against infrastructure with a lifetime
+    # measured in hours. Requires URLSCAN_API_KEY.
+    "urlscan_use_archive": True,
     # Keyless public feeds of live phishing/scam URLs. These keep the watcher
     # productive when crt.sh is overloaded, which it frequently is.
     "feed_urls": [
@@ -324,6 +349,8 @@ def compile_markers() -> List[Tuple[str, int, re.Pattern]]:
 
 
 COMPILED_MARKERS = compile_markers()
+STRONG_MARKERS = frozenset(
+    text for text, weight in CONTENT_MARKERS if weight >= STRONG_MARKER_MIN_WEIGHT)
 COMPILED_BRANDS = [(b, re.compile(r"(?<![a-z0-9])" + re.escape(b) + r"(?![a-z0-9])"))
                    for b in BRAND_MARKERS]
 
@@ -577,6 +604,13 @@ def make_probe_session() -> requests.Session:
 # sources
 # --------------------------------------------------------------------------
 @dataclass
+class Candidate:
+    """A domain to investigate, plus how to reach archived evidence for it."""
+    source: str
+    urlscan_uuid: str = ""
+
+
+@dataclass
 class SourceHealth:
     """
     Per-source outcome for one pass.
@@ -706,11 +740,25 @@ def ct_candidates(sess: requests.Session, query_terms: Sequence[str],
                  + ("..." if len(empty_keywords) > 8 else ""))
 
 
+def apply_date_filter(query: str, max_age_days: int) -> str:
+    """
+    Constrain a urlscan query to recent scans.
+
+    urlscan's index reaches back years and its default ordering will happily
+    return 2024 scans for a tag search. These pages live for hours, so an
+    unconstrained query mostly returns infrastructure that is already dead.
+    """
+    if max_age_days <= 0 or "date:" in query:
+        return query
+    return f"({query}) AND date:>now-{max_age_days}d"
+
+
 def urlscan_candidates(sess: requests.Session,
                        queries: Sequence[Sequence[str]], api_key: str,
                        health: SourceHealth, limit: int = 100,
-                       ) -> Iterator[Tuple[str, str]]:
-    """Yield (domain, source_label) from urlscan searches for kit signatures."""
+                       max_age_days: int = 7,
+                       ) -> Iterator[Tuple[str, str, str]]:
+    """Yield (domain, source_label, scan_uuid) from urlscan kit signatures."""
     headers = {"API-Key": api_key} if api_key else {}
     for entry in queries:
         try:
@@ -718,6 +766,7 @@ def urlscan_candidates(sess: requests.Session,
         except (IndexError, TypeError):
             log.warning("skipping malformed urlscan query entry: %r", entry)
             continue
+        query = apply_date_filter(query, max_age_days)
         health.queries += 1
         try:
             resp = sess.get("https://urlscan.io/api/v1/search/",
@@ -739,9 +788,11 @@ def urlscan_candidates(sess: requests.Session,
         for result in data.get("results", []):
             domain = ((result.get("page") or {}).get("domain") or "").strip().lower()
             if domain and valid_domain(domain):
+                uuid = str(result.get("_id")
+                           or (result.get("task") or {}).get("uuid") or "")
                 count += 1
                 health.yielded += 1
-                yield domain, "urlscan:" + label
+                yield domain, "urlscan:" + label, uuid
         log.debug("urlscan %s -> %d results", label, count)
         time.sleep(1)
 
@@ -879,6 +930,12 @@ class Fingerprint:
     http_status: int = 0
     fetched: bool = False
     error: str = ""
+    # Where the scored content came from: "live" (we fetched the page) or
+    # "urlscan-archive" (the page was gone; urlscan's saved DOM was scored).
+    # Reports must state this - claiming to have seen a live page we never
+    # reached would misrepresent the evidence to an abuse desk.
+    evidence: str = "live"
+    evidence_ref: str = ""
 
     @property
     def score(self) -> int:
@@ -888,6 +945,10 @@ class Fingerprint:
     def served_ok(self) -> bool:
         """True only when the server actually returned a page (2xx)."""
         return 200 <= self.http_status < 300
+
+    @property
+    def strong_markers(self) -> List[str]:
+        return [m for m in self.markers if m in STRONG_MARKERS]
 
     @property
     def has_remote_tool(self) -> bool:
@@ -1033,6 +1094,29 @@ def read_body(resp: requests.Response, cap: int = MAX_BODY_BYTES) -> str:
         return raw.decode("utf-8", errors="replace")
 
 
+def score_html(fp: Fingerprint, html: str) -> None:
+    """Score page content into `fp`. Shared by the live and archived paths."""
+    lowered = html.lower()
+
+    match = RE_TITLE.search(html)
+    if match:
+        fp.title = RE_WS.sub(" ", RE_TAG.sub("", match.group(1))).strip()[:200]
+
+    for text, weight, pattern in COMPILED_MARKERS:
+        if pattern.search(lowered):
+            fp.markers.append(text)
+            fp.content_score += weight
+
+    for brand, pattern in COMPILED_BRANDS:
+        if pattern.search(lowered):
+            fp.brands.append(brand)
+            fp.content_score += 2
+
+    fp.phones = extract_phones(html)
+    if fp.phones:
+        fp.content_score += 2
+
+
 def fingerprint(sess: requests.Session, domain: str, cfg: Dict,
                 timeout: int = 12) -> Fingerprint:
     """One ordinary GET of the landing page, then score what came back."""
@@ -1052,25 +1136,7 @@ def fingerprint(sess: requests.Session, domain: str, cfg: Dict,
             continue
 
         fp.fetched = True
-        lowered = html.lower()
-
-        match = RE_TITLE.search(html)
-        if match:
-            fp.title = RE_WS.sub(" ", RE_TAG.sub("", match.group(1))).strip()[:200]
-
-        for text, weight, pattern in COMPILED_MARKERS:
-            if pattern.search(lowered):
-                fp.markers.append(text)
-                fp.content_score += weight
-
-        for brand, pattern in COMPILED_BRANDS:
-            if pattern.search(lowered):
-                fp.brands.append(brand)
-                fp.content_score += 2
-
-        fp.phones = extract_phones(html)
-        if fp.phones:
-            fp.content_score += 2
+        score_html(fp, html)
 
         host = domain
         if fp.final_url:
@@ -1082,6 +1148,45 @@ def fingerprint(sess: requests.Session, domain: str, cfg: Dict,
         break
 
     fp.error = "; ".join(errors)
+    return fp
+
+
+def fingerprint_archive(sess: requests.Session, domain: str, uuid: str,
+                        api_key: str, cfg: Dict,
+                        timeout: int = 30) -> Optional[Fingerprint]:
+    """
+    Score urlscan's saved DOM for a candidate whose live page is gone.
+
+    This is the difference between a watcher that works and one that mostly
+    finds corpses. These pages are routinely dead within a day of being
+    scanned, and a dead page yields no evidence, no phone number, and no
+    report - while urlscan still holds exactly what the victim would have
+    seen.
+
+    Requires an API key: both /dom/ and the result API answer anonymous
+    callers with {"warning": "You're not logged in!"}.
+    """
+    if not (uuid and api_key):
+        return None
+    try:
+        resp = sess.get(f"https://urlscan.io/dom/{uuid}/", timeout=timeout,
+                        headers={"API-Key": api_key})
+        if resp.status_code != 200:
+            log.debug("urlscan DOM %s: HTTP %s", uuid, resp.status_code)
+            return None
+        html = resp.text
+    except requests.RequestException as exc:
+        log.debug("urlscan DOM %s failed: %s", uuid, exc)
+        return None
+    if len(html) < 64:
+        return None
+
+    fp = Fingerprint(domain=domain,
+                     heuristic_score=domain_heuristic_score(domain, cfg),
+                     evidence="urlscan-archive", evidence_ref=uuid,
+                     fetched=True, http_status=200)
+    score_html(fp, html)
+    fp.ip = resolve_ip(domain)
     return fp
 
 
@@ -1228,6 +1333,14 @@ def _bullets(items: Sequence[str], empty: str = "- none observed") -> str:
     return "\n".join("- " + item for item in items) if items else empty
 
 
+def _evidence_line(fp: Fingerprint) -> str:
+    """State plainly where the scored content came from."""
+    if fp.evidence == "urlscan-archive":
+        return (f"urlscan saved DOM (scan `{fp.evidence_ref}`) - the live page "
+                f"was no longer serving when checked")
+    return "live fetch of the page"
+
+
 def build_markdown(domain: str, fp: Fingerprint, att: Attribution,
                    source: str, timestamp: str) -> str:
     quoted = requests.utils.quote(domain)
@@ -1238,6 +1351,7 @@ def build_markdown(domain: str, fp: Fingerprint, att: Attribution,
 | Domain | `{domain}` |
 | First observed | {timestamp} UTC |
 | Detection source | {source} |
+| Evidence source | {_evidence_line(fp)} |
 | Resolved IP | {fp.ip or 'n/a'} |
 | HTTP status | {fp.http_status or 'n/a'} |
 | Final URL | {fp.final_url or 'n/a'} |
@@ -1320,6 +1434,13 @@ def build_eml(domain: str, fp: Fingerprint, att: Attribution,
     signature = cfg.get("reporter_org") or "(sender - complete before sending)"
     msg["X-Report-Generator"] = f"scamwatch/{VERSION}"
 
+    # Never imply a live observation that did not happen.
+    if fp.evidence == "urlscan-archive":
+        evidence_note = (f"urlscan saved DOM, scan {fp.evidence_ref} "
+                         f"(the page had stopped serving when re-checked)")
+    else:
+        evidence_note = "direct retrieval of the page"
+
     # Only claim what the markers actually support. A report that overstates
     # its evidence is worth less than no report at all, and abuse desks that
     # catch one exaggeration discount everything that follows it.
@@ -1349,6 +1470,7 @@ IP address:  {fp.ip or 'n/a'}
 Registrar:   {att.registrar or 'unknown'}
 Registered:  {att.created or 'unknown'}
 Observed:    {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
+Evidence:    {evidence_note}
 
 Indicators observed on the page:
 {_bullets(fp.markers, '- see attached report')}
@@ -1423,11 +1545,11 @@ def write_reports(sess: requests.Session, domain: str, fp: Fingerprint,
 # pipeline
 # --------------------------------------------------------------------------
 def collect_candidates(args, cfg: Dict, store: Store, api: requests.Session,
-                       ) -> Tuple[Dict[str, str], List[SourceHealth]]:
+                       ) -> Tuple[Dict[str, Candidate], List[SourceHealth]]:
     """Gather new candidate domains from every enabled source."""
     allowlist = {d.lower() for d in cfg["allowlist"]}
     vendor_labels = {v.lower() for v in cfg.get("vendor_labels", [])}
-    candidates: Dict[str, str] = {}
+    candidates: Dict[str, Candidate] = {}
     skipped_allow = 0
 
     ct_health = SourceHealth("ct", skipped=args.no_ct)
@@ -1435,16 +1557,19 @@ def collect_candidates(args, cfg: Dict, store: Store, api: requests.Session,
     feed_health = SourceHealth("feeds", skipped=args.no_feeds)
     healths = [ct_health, urlscan_health, feed_health]
 
-    def consider(domain: str, source: str) -> None:
+    def consider(domain: str, source: str, uuid: str = "") -> None:
         nonlocal skipped_allow
         if domain in candidates:
+            # keep an archive reference if a later source supplies one
+            if uuid and not candidates[domain].urlscan_uuid:
+                candidates[domain].urlscan_uuid = uuid
             return
         if is_allowlisted(domain, allowlist, vendor_labels):
             skipped_allow += 1
             return
         if not args.force and store.seen(domain):
             return
-        candidates[domain] = source
+        candidates[domain] = Candidate(source=source, urlscan_uuid=uuid)
 
     if not args.no_ct:
         query_terms = list(cfg.get("ct_query_terms") or cfg["ct_keywords"])
@@ -1455,11 +1580,12 @@ def collect_candidates(args, cfg: Dict, store: Store, api: requests.Session,
             consider(domain, source)
 
     if not args.no_urlscan:
-        for domain, source in urlscan_candidates(
+        for domain, source, uuid in urlscan_candidates(
                 api, cfg["urlscan_queries"],
                 os.environ.get("URLSCAN_API_KEY", ""),
-                urlscan_health, args.limit):
-            consider(domain, source)
+                urlscan_health, args.limit,
+                int(cfg.get("urlscan_max_age_days", 7))):
+            consider(domain, source, uuid)
 
     if not args.no_feeds:
         for domain, source in feed_candidates(api, cfg, feed_health, store):
@@ -1486,6 +1612,15 @@ def should_confirm(fp: Fingerprint, cfg: Dict) -> bool:
         return True
     if fp.brands and fp.has_remote_tool:
         return True
+
+    # Reaching the threshold by stacking weak markers is not enough. A live
+    # pass surfaced suncoastcreditunion.com - a real credit union - and a
+    # legitimate security-awareness page can easily carry "security alert" +
+    # "your password" + "call the number" for exactly the threshold score.
+    # Require at least one marker that describes something only a scam page
+    # does, such as "virus detected" or an AnyDesk install prompt.
+    if not fp.strong_markers:
+        return False
     return fp.content_score >= cfg["confirm_threshold"]
 
 
@@ -1504,8 +1639,13 @@ def run_once(args, cfg: Dict, store: Store, api: requests.Session,
 
     log.info("new candidates: %d", len(candidates))
 
+    api_key = os.environ.get("URLSCAN_API_KEY", "")
+    use_archive = bool(cfg.get("urlscan_use_archive", True)) and bool(api_key)
+    revived = 0
+
     confirmed = 0
-    for domain, source in sorted(candidates.items()):
+    for domain, cand in sorted(candidates.items()):
+        source = cand.source
         if args.no_fingerprint:
             store.upsert(domain, source, "candidate",
                          domain_heuristic_score(domain, cfg))
@@ -1513,6 +1653,20 @@ def run_once(args, cfg: Dict, store: Store, api: requests.Session,
             continue
 
         fp = fingerprint(probe, domain, cfg)
+
+        # These pages die faster than the sources index them. When the live
+        # fetch finds nothing serving, fall back to urlscan's saved DOM, which
+        # holds what the victim would actually have seen.
+        if not fp.served_ok and use_archive and cand.urlscan_uuid:
+            archived = fingerprint_archive(api, domain, cand.urlscan_uuid,
+                                           api_key, cfg)
+            if archived is not None and archived.markers:
+                log.info("%s is gone (%s); scored urlscan archive instead",
+                         domain, fp.http_status or fp.error or "unreachable")
+                archived.error = fp.error
+                fp = archived
+                revived += 1
+
         store.upsert(domain, source, "candidate", fp.score,
                      ",".join(fp.phones), ";".join(fp.markers[:12]))
 
@@ -1533,8 +1687,13 @@ def run_once(args, cfg: Dict, store: Store, api: requests.Session,
     if not args.dry_run and not args.no_fingerprint:
         write_ioc_sheet(store, args.out / "iocs_phones.csv")
 
-    log.info("pass complete: %d candidates, %d confirmed (reports in %s)",
-             len(candidates), confirmed, args.out)
+    if not args.no_fingerprint and not use_archive:
+        log.warning("no URLSCAN_API_KEY: archived-evidence fallback disabled, so "
+                    "candidates whose page is already gone cannot be confirmed")
+    log.info("pass complete: %d candidates, %d confirmed%s (reports in %s)",
+             len(candidates), confirmed,
+             f", {revived} via archived evidence" if revived else "",
+             args.out)
 
 
 def print_stats(store: Store) -> None:

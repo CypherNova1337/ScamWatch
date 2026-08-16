@@ -26,9 +26,11 @@ mule-account freezes are where arrests actually happen.
    domains the moment they are minted (`*-windows-defender-*`, `live-support-*`,
    bank shortcodes). Queries are deliberately **broad** and refined locally;
    see the crt.sh note under Limitations for why that matters.
-2. **urlscan.io search** — pulls scans matching known kit signatures
-   (`config.js` + `SUPABASE_URL`/`ACCESS_KEY`, the ANZ cluster, the free-host
-   clusters).
+2. **urlscan.io search** — pulls recent scans matching known kit signatures
+   (`config.js` + `SUPABASE_URL`/`ACCESS_KEY`, the ANZ cluster, remote-tool
+   lures on free hosts). Every query is constrained to the last
+   `urlscan_max_age_days`, and each hit carries its scan UUID so archived
+   evidence can be recovered later.
 3. **Public phishing feeds** — OpenPhish and Phishing.Database, filtered down
    to the tech-support keyword set. No API key required. These carry the pass
    when crt.sh is overloaded, which is often.
@@ -36,7 +38,12 @@ mule-account freezes are where arrests actually happen.
    Scores the page against markers (AnyDesk / TeamViewer / ScreenConnect
    install prompts, fake AV alerts, bank impersonation) and extracts the phone
    numbers. Disable entirely with `--no-fingerprint`.
-5. **Attribution and packaging** — RDAP (no API key) for registrar and network,
+5. **Archived-evidence fallback** — when the live page has already been pulled
+   (the common case), urlscan's saved DOM is scored instead. Reports state
+   which of the two the evidence came from, in both the Markdown and the
+   email draft, so an abuse desk is never told you saw something live that
+   you did not.
+6. **Attribution and packaging** — RDAP (no API key) for registrar and network,
    abuse-address lookup, then a Markdown report plus a ready-to-send `.eml`
    draft per confirmed domain.
 
@@ -60,8 +67,13 @@ python3 scamwatch.py --dry-run -v               # detect and score, write nothin
 python3 scamwatch.py --stats                    # what the database knows so far
 ```
 
-Set `URLSCAN_API_KEY` for better urlscan rate limits and full search coverage.
-It runs without one.
+**Set `URLSCAN_API_KEY`.** It is documented elsewhere as optional; in practice
+it is close to required. Without it, urlscan's saved-DOM endpoint and result
+API both answer `{"warning": "You're not logged in!"}`, which disables the
+archived-evidence fallback — and that fallback is what lets the tool confirm
+anything at all against pages that are already gone. See Limitations. A free
+account key is enough. The tool still runs without one; it will just find far
+more corpses than evidence, and it warns you when it does.
 
 ### Useful flags
 
@@ -144,7 +156,12 @@ Keys worth knowing:
   (`%defender%` returns Land Rover dealerships), and this is what keeps the
   results specific. `--limit` counts domains kept, not rows scanned, so this
   costs no recall
-- `urlscan_queries` — `[label, query]` pairs, kit signatures
+- `urlscan_queries` — `[label, query]` pairs, kit signatures. Make them carry
+  real signal: a bare `page.url:"support"` filter was tried and matched a
+  German Minecraft donation page
+- `urlscan_max_age_days` — scans older than this are ignored (default 7)
+- `urlscan_use_archive` — score urlscan's saved DOM when the live page is
+  gone (default `true`, needs `URLSCAN_API_KEY`)
 - `feed_urls` — `[label, url]` pairs of keyless phishing feeds
 - `feed_min_interval` — seconds between feed re-downloads (default 3600). The
   feeds are multi-megabyte files served for free; they are also revalidated
@@ -163,7 +180,7 @@ Keys worth knowing:
 them and sends them. That is deliberate and you should keep it that way.
 
 **A false positive is worse than a miss.** Reporting a legitimate business to
-its registrar can take a real site offline. Three guards exist:
+its registrar can take a real site offline. Four guards exist:
 
 1. **The allowlist.** Legitimate vendors, banks, and every `.gov` / `.edu` /
    `.mil` / `.police.uk`-class suffix are never reported, regardless of what a
@@ -191,7 +208,14 @@ its registrar can take a real site offline. Three guards exist:
    This is not hypothetical: during testing, a live page whose only marker was
    `error code` reached a combined score of 6 (half of it from the domain name)
    and was reported. It scores 3 against the current gate and is rejected.
-3. **`--dry-run`.** Use it whenever you change scoring or keywords.
+3. **At least one strong marker is required.** Reaching the threshold by
+   stacking weak signals is not enough. A live pass surfaced
+   `suncoastcreditunion.com`, a real credit union — and a legitimate
+   security-awareness page can carry `security alert` + `your password` +
+   `call the number`, which is exactly the threshold. Confirmation now needs a
+   marker that describes something only a scam page does: an AnyDesk install
+   prompt, `virus detected`, `do not restart your computer`.
+4. **`--dry-run`.** Use it whenever you change scoring or keywords.
 
 **Verify each report before sending.** Open the page yourself, or check the
 urlscan link in the report. The `.eml` is a draft, not a verdict.
@@ -220,6 +244,14 @@ urlscan link in the report. The `.eml` is a draft, not a verdict.
 - **Scoring is heuristic.** It is tuned to be specific rather than sensitive.
   Expect to miss pages that are pure image or that render entirely via
   JavaScript — there is no browser here, only an HTTP GET.
+- **The targets die faster than the sources index them.** This is the single
+  biggest constraint on the whole approach. Of 14 urlscan hits fetched during
+  testing, 10 returned a hosting "site not found" stub, and the two freshest
+  and most on-target — `metrobank-anydesk-support.com.ph` and
+  `anydesk-support-metrobank.com.ph`, scanned the previous day — were already
+  503 and unreachable. This is why queries are date-constrained and why the
+  archived-DOM fallback exists; without an API key to enable that fallback,
+  expect most candidates to be dead on arrival.
 - **Most feed candidates will never confirm, and that is correct.** The public
   feeds are dominated by credential phishing rather than tech-support fraud;
   in a live pass, 843 candidates produced a single confirmation. The keyword

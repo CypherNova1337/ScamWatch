@@ -266,6 +266,34 @@ class TestConfirmationGate(unittest.TestCase):
                             phones=["+18335550142"])
         self.assertTrue(sw.should_confirm(fp, self.cfg))
 
+    def test_weak_markers_cannot_stack_to_a_confirmation(self):
+        """
+        Regression, observed live: suncoastcreditunion.com - a real credit
+        union - surfaced as a candidate. A legitimate security-awareness page
+        can carry "security alert" + "your password" + "call the number",
+        which is exactly the threshold. At least one marker must describe
+        something only a scam page does.
+        """
+        fp = sw.Fingerprint(domain="suncoastcreditunion.com", content_score=6,
+                            fetched=True, http_status=200,
+                            markers=["security alert", "your password",
+                                     "call the number"])
+        self.assertEqual(fp.strong_markers, [])
+        self.assertFalse(sw.should_confirm(fp, self.cfg))
+
+    def test_one_strong_marker_unlocks_the_threshold(self):
+        fp = sw.Fingerprint(domain="evil.sbs", content_score=6, fetched=True,
+                            http_status=200,
+                            markers=["virus detected", "security alert"])
+        self.assertIn("virus detected", fp.strong_markers)
+        self.assertTrue(sw.should_confirm(fp, self.cfg))
+
+    def test_strong_marker_set_is_weight_derived(self):
+        self.assertIn("anydesk", sw.STRONG_MARKERS)
+        self.assertIn("virus detected", sw.STRONG_MARKERS)
+        self.assertNotIn("toll-free", sw.STRONG_MARKERS)
+        self.assertNotIn("error code", sw.STRONG_MARKERS)
+
     def test_confirms_on_strong_content_score(self):
         fp = sw.Fingerprint(domain="x.sbs", content_score=12, fetched=True,
                             http_status=200,
@@ -423,6 +451,113 @@ class TestCtRefinement(unittest.TestCase):
             ["windows-defender", "defender-alert"], 2, health,
             require_refine=True))
         self.assertEqual(len(got), 2)
+
+
+class TestUrlscanDateFilter(unittest.TestCase):
+    """
+    urlscan's index reaches back years; these pages live for hours. Of 14
+    unfiltered hits fetched during testing, 10 returned a hosting "site not
+    found" stub, so recency is not a nicety.
+    """
+
+    def test_wraps_and_constrains(self):
+        self.assertEqual(sw.apply_date_filter('page.url:"anydesk"', 7),
+                         '(page.url:"anydesk") AND date:>now-7d')
+
+    def test_parenthesised_so_or_queries_are_not_broken(self):
+        out = sw.apply_date_filter('a:"x" OR b:"y"', 3)
+        self.assertTrue(out.startswith('(a:"x" OR b:"y")'))
+
+    def test_respects_an_explicit_date_filter(self):
+        q = 'page.url:"anydesk" AND date:>now-1d'
+        self.assertEqual(sw.apply_date_filter(q, 7), q)
+
+    def test_disabled_when_zero_or_negative(self):
+        self.assertEqual(sw.apply_date_filter('x:"y"', 0), 'x:"y"')
+        self.assertEqual(sw.apply_date_filter('x:"y"', -1), 'x:"y"')
+
+
+class TestArchiveFallback(unittest.TestCase):
+    """
+    The live page is usually gone by the time a candidate surfaces, so the
+    saved DOM is what turns a dead lead into reportable evidence.
+    """
+
+    SCAM_DOM = ("<html><head><title>Windows Defender Alert</title></head><body>"
+                "<h1>Virus detected</h1><p>Do not restart your PC. "
+                "Call <a href='tel:+18335550142'>1-833-555-0142</a> and "
+                "download AnyDesk so a technician can share your screen.</p>"
+                "</body></html>")
+
+    class FakeSession:
+        def __init__(self, status=200, text=""):
+            self.status, self.text_ = status, text
+            self.headers_seen = None
+
+        def get(self, url, timeout=None, headers=None, **kw):
+            self.headers_seen = headers
+            outer = self
+
+            class R:
+                status_code = outer.status
+                text = outer.text_
+            return R()
+
+    def test_scores_archived_dom_and_marks_provenance(self):
+        sess = self.FakeSession(200, self.SCAM_DOM)
+        fp = sw.fingerprint_archive(sess, "evil.sbs", "uuid-1", "key",
+                                    sw.DEFAULT_CONFIG)
+        self.assertIsNotNone(fp)
+        self.assertEqual(fp.evidence, "urlscan-archive")
+        self.assertEqual(fp.evidence_ref, "uuid-1")
+        self.assertIn("anydesk", fp.markers)
+        self.assertIn("+18335550142", fp.phones)
+        self.assertTrue(sw.should_confirm(fp, sw.DEFAULT_CONFIG))
+
+    def test_sends_the_api_key(self):
+        sess = self.FakeSession(200, self.SCAM_DOM)
+        sw.fingerprint_archive(sess, "evil.sbs", "u", "secret",
+                               sw.DEFAULT_CONFIG)
+        self.assertEqual(sess.headers_seen.get("API-Key"), "secret")
+
+    def test_requires_uuid_and_key(self):
+        sess = self.FakeSession(200, self.SCAM_DOM)
+        self.assertIsNone(sw.fingerprint_archive(sess, "e.sbs", "", "key",
+                                                 sw.DEFAULT_CONFIG))
+        self.assertIsNone(sw.fingerprint_archive(sess, "e.sbs", "u", "",
+                                                 sw.DEFAULT_CONFIG))
+
+    def test_anonymous_403_yields_nothing(self):
+        sess = self.FakeSession(403, '{"warning": "You\'re not logged in!"}')
+        self.assertIsNone(sw.fingerprint_archive(sess, "e.sbs", "u", "key",
+                                                 sw.DEFAULT_CONFIG))
+
+    def test_empty_dom_yields_nothing(self):
+        sess = self.FakeSession(200, "")
+        self.assertIsNone(sw.fingerprint_archive(sess, "e.sbs", "u", "key",
+                                                 sw.DEFAULT_CONFIG))
+
+    def test_reports_state_archived_provenance(self):
+        fp = sw.Fingerprint(domain="e.sbs", content_score=9, fetched=True,
+                            http_status=200, markers=["anydesk"],
+                            evidence="urlscan-archive", evidence_ref="u-9")
+        md = sw.build_markdown("e.sbs", fp, sw.Attribution(), "urlscan:x", "t")
+        self.assertIn("urlscan saved DOM", md)
+        self.assertIn("u-9", md)
+
+        live = sw.Fingerprint(domain="e.sbs", content_score=9, fetched=True,
+                              http_status=200, markers=["anydesk"])
+        self.assertIn("live fetch", sw.build_markdown(
+            "e.sbs", live, sw.Attribution(), "ct:x", "t"))
+
+
+class TestCandidateMerging(unittest.TestCase):
+    def test_archive_reference_is_kept_from_a_later_source(self):
+        c = sw.Candidate(source="ct:defender")
+        self.assertEqual(c.urlscan_uuid, "")
+        c.urlscan_uuid = "uuid-2"
+        self.assertEqual(c.source, "ct:defender")
+        self.assertEqual(c.urlscan_uuid, "uuid-2")
 
 
 class TestStoreMeta(unittest.TestCase):
