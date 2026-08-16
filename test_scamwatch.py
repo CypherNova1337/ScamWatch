@@ -451,6 +451,29 @@ class TestReportRendering(unittest.TestCase):
         self.assertIn("live-support-defender.sbs", msg["Subject"])
         self.assertIn("+18335550142", msg.get_content())
 
+    def test_eml_claims_only_what_the_markers_support(self):
+        """An abuse draft must not assert remote-access tooling it never saw."""
+        import email as email_mod
+        import email.policy
+
+        def body_for(fp):
+            raw = sw.build_eml(fp.domain, fp, sw.Attribution(
+                registrar_abuse="a@b.test"), sw.DEFAULT_CONFIG, "r.md")
+            return email_mod.message_from_bytes(
+                raw, policy=email_mod.policy.default).get_content()
+
+        with_tool = body_for(sw.Fingerprint(
+            domain="a.sbs", markers=["anydesk"], phones=["+18335550142"]))
+        self.assertIn("remote-access software", with_tool)
+
+        without_tool = body_for(sw.Fingerprint(
+            domain="b.sbs", markers=["virus detected"], phones=["+18335550142"]))
+        self.assertNotIn("AnyDesk / TeamViewer", without_tool)
+        self.assertIn("telephone number", without_tool)
+
+        bare = body_for(sw.Fingerprint(domain="c.sbs", markers=["virus detected"]))
+        self.assertNotIn("AnyDesk / TeamViewer", bare)
+
     def test_csv_round_trips_commas_in_fields(self):
         import csv as csv_mod
         with tempfile.TemporaryDirectory() as tmp:

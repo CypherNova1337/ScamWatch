@@ -1269,6 +1269,25 @@ def build_eml(domain: str, fp: Fingerprint, att: Attribution,
 
     signature = cfg.get("reporter_org") or "(sender - complete before sending)"
     msg["X-Report-Generator"] = f"scamwatch/{VERSION}"
+
+    # Only claim what the markers actually support. A report that overstates
+    # its evidence is worth less than no report at all, and abuse desks that
+    # catch one exaggeration discount everything that follows it.
+    if fp.has_remote_tool:
+        mechanism = (
+            "The page instructs visitors to install remote-access software\n"
+            "(AnyDesk / TeamViewer / ConnectWise ScreenConnect) and to hand over a\n"
+            "remote session, which is the standard tech-support fraud pattern.")
+    elif fp.phones:
+        mechanism = (
+            "The page presents a fabricated security or billing warning together\n"
+            "with a telephone number, which is the standard entry point for\n"
+            "tech-support fraud: the call handler then talks the victim into\n"
+            "granting remote access or making a payment.")
+    else:
+        mechanism = (
+            "The page presents a fabricated security or billing warning designed\n"
+            "to panic visitors into contacting the operator.")
     msg.set_content(f"""Hello,
 
 The domain below is serving an active tech-support scam landing page and is
@@ -1290,9 +1309,7 @@ Brands impersonated:
 Telephone numbers presented to visitors:
 {_bullets(fp.phones)}
 
-The page instructs visitors to install remote-access software
-(AnyDesk / TeamViewer / ConnectWise ScreenConnect) and to hand over a remote
-session, which is the standard tech-support fraud pattern. Independent
+{mechanism} Independent
 corroboration is available at:
 
   https://urlscan.io/search/#page.domain%3A%22{requests.utils.quote(domain)}%22
