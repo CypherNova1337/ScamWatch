@@ -453,6 +453,51 @@ class TestCtRefinement(unittest.TestCase):
         self.assertEqual(len(got), 2)
 
 
+class TestBodyDecoding(unittest.TestCase):
+    """
+    Regression, crashed a live pass: read_body used resp.apparent_encoding as
+    its fallback, which reads resp.content and raises RuntimeError once the
+    body has been consumed by iter_content. Every server that omits a charset
+    from Content-Type took down the entire pass, not just that candidate.
+    """
+
+    def test_decodes_utf8_without_a_header_charset(self):
+        self.assertEqual(sw.decode_body(b"<p>caf\xc3\xa9</p>", None),
+                         "<p>café</p>")
+
+    def test_honours_header_charset(self):
+        self.assertEqual(sw.decode_body(b"<p>caf\xe9</p>", "iso-8859-1"),
+                         "<p>café</p>")
+
+    def test_sniffs_meta_charset_when_header_is_absent(self):
+        raw = b'<meta charset="iso-8859-1"><p>caf\xe9</p>'
+        self.assertIn("café", sw.decode_body(raw, None))
+
+    def test_unknown_codec_falls_back_instead_of_raising(self):
+        self.assertIsInstance(sw.decode_body(b"hello", "no-such-codec"), str)
+
+    def test_undecodable_bytes_never_raise(self):
+        self.assertIsInstance(sw.decode_body(b"\xff\xfe\x00bad", None), str)
+
+    def test_empty_body(self):
+        self.assertEqual(sw.decode_body(b"", None), "")
+
+    def test_read_body_does_not_touch_apparent_encoding(self):
+        """The real failure: apparent_encoding raises after streaming."""
+        class Consumed:
+            encoding = None
+            headers = {}
+
+            def iter_content(self, n):
+                yield b"<p>hi</p>"
+
+            @property
+            def apparent_encoding(self):
+                raise RuntimeError(
+                    "The content for this response was already consumed")
+        self.assertEqual(sw.read_body(Consumed()), "<p>hi</p>")
+
+
 class TestUrlscanDateFilter(unittest.TestCase):
     """
     urlscan's index reaches back years; these pages live for hours. Of 14

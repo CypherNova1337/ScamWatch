@@ -316,6 +316,7 @@ RE_NANP = re.compile(r"[2-9]\d{2}[2-9]\d{6}")
 RE_TITLE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
 RE_SCRIPT_STYLE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.I | re.S)
 RE_TAG = re.compile(r"<[^>]+>")
+RE_META_CHARSET = re.compile(rb'charset\s*=\s*["\']?\s*([a-zA-Z0-9_\-]+)', re.I)
 RE_TEL_HREF = re.compile(r"""href\s*=\s*["']tel:([^"']{5,32})["']""", re.I)
 RE_WS = re.compile(r"\s+")
 
@@ -1087,11 +1088,32 @@ def read_body(resp: requests.Response, cap: int = MAX_BODY_BYTES) -> str:
         if total >= cap:
             break
     raw = b"".join(chunks)[:cap]
-    encoding = resp.encoding or resp.apparent_encoding or "utf-8"
-    try:
-        return raw.decode(encoding, errors="replace")
-    except (LookupError, TypeError):
-        return raw.decode("utf-8", errors="replace")
+    return decode_body(raw, resp.encoding)
+
+
+def decode_body(raw: bytes, header_encoding: Optional[str] = None) -> str:
+    """
+    Decode a response body read in streaming mode.
+
+    Deliberately does not touch `resp.apparent_encoding`: that property reads
+    `resp.content`, which raises RuntimeError once the body has been consumed
+    via iter_content. Any server omitting a charset from Content-Type would
+    otherwise take down the whole pass, which is exactly what happened in
+    testing. Sniff the meta charset from the bytes already in hand instead.
+    """
+    encoding = header_encoding
+    if not encoding:
+        match = RE_META_CHARSET.search(raw[:8192])
+        if match:
+            encoding = match.group(1).decode("ascii", "ignore")
+    for candidate in (encoding, "utf-8", "latin-1"):
+        if not candidate:
+            continue
+        try:
+            return raw.decode(candidate, errors="replace")
+        except (LookupError, TypeError):
+            continue
+    return raw.decode("utf-8", errors="replace")
 
 
 def score_html(fp: Fingerprint, html: str) -> None:
@@ -1652,7 +1674,16 @@ def run_once(args, cfg: Dict, store: Store, api: requests.Session,
             log.debug("passive candidate: %s (%s)", domain, source)
             continue
 
-        fp = fingerprint(probe, domain, cfg)
+        try:
+            fp = fingerprint(probe, domain, cfg)
+        except Exception:
+            # A watcher must survive one hostile or malformed response. Losing
+            # the remaining candidates because of a single bad page is a far
+            # worse outcome than skipping that page.
+            log.exception("fingerprint failed for %s - skipping", domain)
+            store.upsert(domain, source, "error",
+                         domain_heuristic_score(domain, cfg))
+            continue
 
         # These pages die faster than the sources index them. When the live
         # fetch finds nothing serving, fall back to urlscan's saved DOM, which
