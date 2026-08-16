@@ -220,6 +220,17 @@ urlscan link in the report. The `.eml` is a draft, not a verdict.
 - **Scoring is heuristic.** It is tuned to be specific rather than sensitive.
   Expect to miss pages that are pure image or that render entirely via
   JavaScript — there is no browser here, only an HTTP GET.
+- **Most feed candidates will never confirm, and that is correct.** The public
+  feeds are dominated by credential phishing rather than tech-support fraud;
+  in a live pass, 843 candidates produced a single confirmation. The keyword
+  filter narrows them, but a page that phishes a bank login is not a
+  tech-support scam and the gate rightly refuses to describe it as one. The
+  feeds earn their place by carrying the pass when crt.sh is down — if you
+  would rather not spend the fingerprint budget, run `--no-feeds`.
+- **Candidates are fingerprinted once, when first seen.** A domain that is
+  parked at discovery and turns malicious an hour later is not revisited
+  unless you pass `--force`. Re-checking known candidates on a slower cycle
+  would be the natural next feature.
 
 ## Reporting channels
 
