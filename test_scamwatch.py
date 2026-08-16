@@ -189,11 +189,24 @@ class TestConfirmationGate(unittest.TestCase):
         self.assertFalse(sw.should_confirm(fp, self.cfg))
 
     def test_domain_heuristic_cannot_top_up_a_weak_marker(self):
-        """A suspicious name plus one trivial marker must not confirm."""
+        """
+        Regression, observed live: a support-themed page whose only marker was
+        "error code" plus a phone number reached a combined score of 6 and was
+        reported. The name contributed half of that. Confirmation must read the
+        content score alone, so this case now falls well short.
+        """
         fp = sw.Fingerprint(domain="direct-tv-customer-support-number.pages.dev",
-                            heuristic_score=5, content_score=1, fetched=True,
-                            http_status=200, markers=["error code"])
+                            heuristic_score=3, content_score=3, fetched=True,
+                            http_status=200, markers=["error code"],
+                            phones=["+13329100008"])
         self.assertEqual(fp.score, 6)               # would have passed a raw gate
+        self.assertFalse(sw.should_confirm(fp, self.cfg))
+
+    def test_phone_alone_is_not_enough_without_a_remote_tool(self):
+        """A support number on a page is not by itself a tech-support scam."""
+        fp = sw.Fingerprint(domain="x.sbs", content_score=3, fetched=True,
+                            http_status=200, markers=["helpline"],
+                            phones=["+18335550142"])
         self.assertFalse(sw.should_confirm(fp, self.cfg))
 
     def test_takedown_stub_is_not_evidence(self):

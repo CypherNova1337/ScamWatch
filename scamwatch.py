@@ -60,6 +60,19 @@ CT_FAILURE_LIMIT = 5
 # configuration
 # --------------------------------------------------------------------------
 DEFAULT_CONFIG: Dict = {
+    # What actually gets sent to crt.sh. Deliberately broad and cheap: crt.sh
+    # runs an ILIKE and degrades hard on selective compound patterns - measured
+    # side by side, "%defender%" returns thousands of rows while
+    # "%windows-defender%" intermittently returns an empty array or 502s. Ask
+    # broad, then refine locally against ct_keywords below. Highest-yield terms
+    # come first so a mid-pass circuit-breaker trip still gets the good ones.
+    "ct_query_terms": [
+        "defender", "anydesk", "teamviewer", "support-live", "support-help",
+        "livesupport", "livehelp", "live-chat", "tech-support", "helpdesk",
+        "remote-support", "virus-alert", "security-alert", "pc-security",
+    ],
+    # Local refinement only - these are matched against hostnames already
+    # returned by a broad query, never sent to crt.sh directly.
     "ct_keywords": [
         "windows-defender", "microsoft-support", "windows-support",
         "live-support", "live-chat", "tech-support", "pc-security",
@@ -559,20 +572,29 @@ class SourceHealth:
         return detail + ")"
 
 
-def ct_candidates(sess: requests.Session, keywords: Sequence[str], limit: int,
+def ct_candidates(sess: requests.Session, query_terms: Sequence[str],
+                  refine_keywords: Sequence[str], limit: int,
                   health: SourceHealth, timeout: int = 60,
                   ) -> Iterator[Tuple[str, str]]:
-    """Yield (domain, source_label) for freshly issued certs matching keywords."""
+    """
+    Yield (domain, source_label) for freshly issued certs matching keywords.
+
+    Queries are broad by design and refined locally. crt.sh answers a cheap
+    "%defender%" with thousands of rows but intermittently gives an empty
+    array or a 502 for "%windows-defender%", so asking narrowly loses
+    coverage in a way that is silent and easy to mistake for "no results".
+    """
     emitted: Set[str] = set()
     consecutive_failures = 0
-    for keyword in keywords:
+    empty_keywords: List[str] = []
+    for index, keyword in enumerate(query_terms):
         # crt.sh outages are all-or-nothing. Once it is clearly down, stop
         # hammering it: grinding through the whole keyword list at several
         # seconds per failure would push a pass past its own loop interval.
         if consecutive_failures >= CT_FAILURE_LIMIT:
             health.note = f"gave up after {consecutive_failures} consecutive failures"
             log.warning("crt.sh appears to be down - skipping remaining %d keywords",
-                        len(keywords) - keywords.index(keyword))
+                        len(query_terms) - index)
             break
         health.queries += 1
         try:
@@ -615,9 +637,23 @@ def ct_candidates(sess: requests.Session, keywords: Sequence[str], limit: int,
                 emitted.add(domain)
                 taken += 1
                 health.yielded += 1
-                yield domain, "ct:" + keyword
+                refined = next((k for k in refine_keywords if k in domain), "")
+                yield domain, f"ct:{keyword}+{refined}" if refined else f"ct:{keyword}"
+        if not rows:
+            # crt.sh answers some patterns with an empty array rather than an
+            # error. Surface it: an operator tuning keywords needs to know
+            # which ones are returning nothing at all.
+            empty_keywords.append(keyword)
         log.debug("crt.sh %r -> %d rows, %d taken", keyword, len(rows), taken)
         time.sleep(1)  # be polite to crt.sh
+
+    if empty_keywords:
+        note = f"{len(empty_keywords)} keywords returned no rows"
+        health.note = f"{health.note}; {note}" if health.note else note
+        log.info("crt.sh returned nothing for %d/%d keywords: %s",
+                 len(empty_keywords), health.queries,
+                 ", ".join(empty_keywords[:8])
+                 + ("..." if len(empty_keywords) > 8 else ""))
 
 
 def urlscan_candidates(sess: requests.Session,
@@ -1343,9 +1379,10 @@ def collect_candidates(args, cfg: Dict, store: Store, api: requests.Session,
         candidates[domain] = source
 
     if not args.no_ct:
-        keywords = list(cfg["ct_keywords"]) + list(cfg["brand_shortcodes"])
-        for domain, source in ct_candidates(api, keywords, args.limit,
-                                            ct_health):
+        query_terms = list(cfg.get("ct_query_terms") or cfg["ct_keywords"])
+        refine = list(cfg["ct_keywords"]) + list(cfg["brand_shortcodes"])
+        for domain, source in ct_candidates(api, query_terms, refine,
+                                            args.limit, ct_health):
             consider(domain, source)
 
     if not args.no_urlscan:

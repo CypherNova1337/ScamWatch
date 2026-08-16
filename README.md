@@ -24,7 +24,8 @@ mule-account freezes are where arrests actually happen.
 
 1. **Certificate Transparency (crt.sh)** — catches freshly-certed lookalike
    domains the moment they are minted (`*-windows-defender-*`, `live-support-*`,
-   bank shortcodes).
+   bank shortcodes). Queries are deliberately **broad** and refined locally;
+   see the crt.sh note under Limitations for why that matters.
 2. **urlscan.io search** — pulls scans matching known kit signatures
    (`config.js` + `SUPABASE_URL`/`ACCESS_KEY`, the ANZ cluster, the free-host
    clusters).
@@ -134,7 +135,10 @@ defaults, so upgrades pick up new keys without wiping your changes.
 
 Keys worth knowing:
 
-- `ct_keywords`, `brand_shortcodes` — what to hunt in CT logs
+- `ct_query_terms` — what is actually sent to crt.sh. Keep these broad and
+  cheap; highest-yield first, since the circuit breaker may cut a pass short
+- `ct_keywords`, `brand_shortcodes` — local refinement, matched against
+  hostnames a broad query already returned. Never sent to crt.sh directly
 - `urlscan_queries` — `[label, query]` pairs, kit signatures
 - `feed_urls` — `[label, url]` pairs of keyless phishing feeds
 - `feed_min_interval` — seconds between feed re-downloads (default 3600). The
@@ -142,7 +146,8 @@ Keys worth knowing:
   with `ETag`/`If-Modified-Since`, so a `--loop` at 300s does not re-pull them
   on every pass
 - `allowlist` — **read this before tuning anything else** (below)
-- `confirm_threshold` — score needed before a report is written
+- `confirm_threshold` — **content** score needed before a report is written.
+  The domain-name heuristic is scored separately and deliberately excluded
 - `reporter_from`, `reporter_org` — your identity, stamped into `.eml` drafts
 
 ## Operating notes — read before you send anything
@@ -157,9 +162,16 @@ its registrar can take a real site offline. Three guards exist:
    `.mil` / `.police.uk`-class suffix are never reported, regardless of what a
    keyword search turns up — `%windows-defender%` on crt.sh matches genuine
    Microsoft certificates. Extend `allowlist` freely; it is cheap insurance.
-2. **Confirmation requires served content.** A domain is never confirmed on its
-   name alone, no matter how suspicious it looks. It must have been fetched and
-   must have matched real page markers.
+2. **Confirmation requires served content.** Each candidate carries two
+   separate scores: a *name heuristic* (ranking hint) and a *content score*
+   (what the server actually served). Only the content score is compared
+   against `confirm_threshold`, so a name like `windows-defender-alert.sbs`
+   can never top up one weak marker into a confirmation. A non-2xx response
+   also never confirms — a 403/451 takedown stub is not evidence.
+
+   This is not hypothetical: during testing, a live page whose only marker was
+   `error code` reached a combined score of 6 (half of it from the domain name)
+   and was reported. It scores 3 against the current gate and is rejected.
 3. **`--dry-run`.** Use it whenever you change scoring or keywords.
 
 **Verify each report before sending.** Open the page yourself, or check the
@@ -167,11 +179,16 @@ urlscan link in the report. The `.eml` is a draft, not a verdict.
 
 ## Limitations, stated honestly
 
-- **crt.sh is unreliable.** It regularly returns 502/503 under load, and some
-  keyword patterns legitimately return zero rows. Every pass prints a
-  `sources:` line reporting each source's health, because a watcher that
-  silently stops watching is the real failure mode. If a source is dead you
-  will see `FAILED`, and if nothing came back at all you get a warning.
+- **crt.sh is unreliable, and its failures are silent.** Measured directly:
+  `%defender%` returned 2233 rows while `%windows-defender%` returned an empty
+  array on one attempt and a 502 minutes later. An empty array is *not*
+  evidence of absence — it is often the server giving up on an expensive
+  pattern. Two consequences are built in: queries are broad by default
+  (`ct_query_terms`) and refined locally, and every pass prints a `sources:`
+  line with each source's health plus a count of keywords that came back
+  empty. A dead source reads `FAILED`; it never just goes quiet. A circuit
+  breaker also stops the pass hammering crt.sh after 5 consecutive failures,
+  so an outage cannot stall a pass past its own loop interval.
 - **`--no-fingerprint` writes no reports.** It cannot: confirmation requires
   looking at the page. Passive mode records names for later review only.
 - **Phone canonicalisation is best-effort.** Numbers are normalised to E.164
