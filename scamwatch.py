@@ -256,6 +256,16 @@ CONTENT_MARKERS: List[Tuple[str, int]] = [
     ("error code", 1), ("firewall breach", 3), ("ip address has been", 3),
 ]
 
+# Domain-parking and for-sale pages. These are not scam landing pages: the
+# name may be registered for later abuse, but nothing is being served to a
+# victim yet, and there is nothing for an abuse desk to action.
+PARKING_MARKERS: List[str] = [
+    "parklogic", "sedoparking", "bodis.com", "above.com", "afternic",
+    "dan.com", "domain is for sale", "buy this domain", "this domain is for sale",
+    "domain parking", "parked domain", "hugedomains", "domainmarket",
+    "namesilo parking", "cashparking", "domain broker",
+]
+
 # Bank / brand names whose presence on a non-allowlisted domain is a strong
 # impersonation signal. Matched with word boundaries only.
 BRAND_MARKERS: List[str] = [
@@ -349,6 +359,7 @@ def compile_markers() -> List[Tuple[str, int, re.Pattern]]:
     return out
 
 
+COMPILED_PARKING = [re.compile(re.escape(m)) for m in PARKING_MARKERS]
 COMPILED_MARKERS = compile_markers()
 STRONG_MARKERS = frozenset(
     text for text, weight in CONTENT_MARKERS if weight >= STRONG_MARKER_MIN_WEIGHT)
@@ -930,6 +941,7 @@ class Fingerprint:
     final_url: str = ""
     http_status: int = 0
     fetched: bool = False
+    parked: bool = False
     error: str = ""
     # Where the scored content came from: "live" (we fetched the page) or
     # "urlscan-archive" (the page was gone; urlscan's saved DOM was scored).
@@ -1116,9 +1128,32 @@ def decode_body(raw: bytes, header_encoding: Optional[str] = None) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
+def scrub_own_hostname(lowered: str, domain: str) -> str:
+    """
+    Remove the page's own hostname from text before scoring it.
+
+    Parking pages and error stubs print the hostname they were reached by, so
+    a domain like "metrobank-anydesk-support.com.ph" hands itself an "anydesk"
+    content marker just by being displayed. That silently reintroduces exactly
+    the name-based scoring the confirmation gate is meant to exclude.
+    """
+    if not domain:
+        return lowered
+    variants = {domain, domain[4:] if domain.startswith("www.") else "www." + domain}
+    for variant in sorted(variants, key=len, reverse=True):
+        if variant:
+            lowered = lowered.replace(variant, " ")
+    return lowered
+
+
 def score_html(fp: Fingerprint, html: str) -> None:
     """Score page content into `fp`. Shared by the live and archived paths."""
-    lowered = html.lower()
+    lowered = scrub_own_hostname(html.lower(), fp.domain)
+
+    for pattern in COMPILED_PARKING:
+        if pattern.search(lowered):
+            fp.parked = True
+            break
 
     match = RE_TITLE.search(html)
     if match:
@@ -1629,6 +1664,11 @@ def should_confirm(fp: Fingerprint, cfg: Dict) -> bool:
     top up a single weak marker into a confirmation.
     """
     if not fp.fetched or not fp.served_ok or not fp.markers:
+        return False
+    # A parked or for-sale page is not a scam landing page. The name may be
+    # destined for abuse, but nothing is being served and an abuse desk has
+    # nothing to act on.
+    if fp.parked:
         return False
     if fp.phones and fp.has_remote_tool:
         return True

@@ -498,6 +498,62 @@ class TestBodyDecoding(unittest.TestCase):
         self.assertEqual(sw.read_body(Consumed()), "<p>hi</p>")
 
 
+class TestHostnameScrubbing(unittest.TestCase):
+    """
+    Regression, observed live: metrobank-anydesk-support.com.ph is a parked
+    domain whose parking page prints its own hostname. That handed it an
+    "anydesk" *content* marker purely from its name, quietly reintroducing the
+    name-based scoring the confirmation gate exists to exclude.
+    """
+
+    def test_hostname_occurrences_do_not_score(self):
+        fp = sw.Fingerprint(domain="metrobank-anydesk-support.com.ph",
+                            fetched=True, http_status=200)
+        sw.score_html(fp, "<p>metrobank-anydesk-support.com.ph</p>")
+        self.assertEqual(fp.markers, [])
+        self.assertEqual(fp.content_score, 0)
+
+    def test_real_mentions_still_score(self):
+        fp = sw.Fingerprint(domain="metrobank-anydesk-support.com.ph",
+                            fetched=True, http_status=200)
+        sw.score_html(fp, "<p>Please download AnyDesk to continue</p>")
+        self.assertIn("anydesk", fp.markers)
+
+    def test_www_variant_is_scrubbed_too(self):
+        fp = sw.Fingerprint(domain="anydesk-support.sbs", fetched=True)
+        sw.score_html(fp, "<p>www.anydesk-support.sbs</p>")
+        self.assertEqual(fp.markers, [])
+
+    def test_scrub_is_a_noop_without_a_domain(self):
+        self.assertEqual(sw.scrub_own_hostname("anydesk here", ""),
+                         "anydesk here")
+
+
+class TestParkedPages(unittest.TestCase):
+    def test_parking_page_is_detected_and_never_confirms(self):
+        fp = sw.Fingerprint(domain="evil.sbs", fetched=True, http_status=200)
+        sw.score_html(fp, "<p>Virus detected! Download AnyDesk. "
+                          "<a href='https://parking3.parklogic.com/x'>x</a></p>")
+        self.assertTrue(fp.parked)
+        self.assertTrue(fp.markers)          # markers still recorded
+        self.assertFalse(sw.should_confirm(fp, sw.DEFAULT_CONFIG))
+
+    def test_for_sale_wording_detected(self):
+        for text in ("This domain is for sale", "buy this domain today",
+                     "Parked domain"):
+            with self.subTest(text=text):
+                fp = sw.Fingerprint(domain="e.sbs", fetched=True)
+                sw.score_html(fp, f"<p>{text}</p>")
+                self.assertTrue(fp.parked)
+
+    def test_ordinary_scam_page_is_not_parked(self):
+        fp = sw.Fingerprint(domain="e.sbs", fetched=True, http_status=200)
+        sw.score_html(fp, "<p>Virus detected. Call 1-833-555-0142 and "
+                          "install AnyDesk.</p>")
+        self.assertFalse(fp.parked)
+        self.assertTrue(sw.should_confirm(fp, sw.DEFAULT_CONFIG))
+
+
 class TestUrlscanDateFilter(unittest.TestCase):
     """
     urlscan's index reaches back years; these pages live for hours. Of 14
