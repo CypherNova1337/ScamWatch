@@ -554,6 +554,73 @@ class TestParkedPages(unittest.TestCase):
         self.assertTrue(sw.should_confirm(fp, sw.DEFAULT_CONFIG))
 
 
+class TestTopicVersusIntent(unittest.TestCase):
+    """
+    Regression, measured against 98 live pages: topic-only scoring confirmed
+    seven and every one was a false positive - two blog posts about malware, a
+    security vendor's advisory on AnyDesk phishing, and four genuine computer
+    repair businesses. They all legitimately say "your computer is infected"
+    and "we use AnyDesk". Vocabulary describes a topic; it does not establish
+    intent.
+    """
+
+    def setUp(self):
+        self.cfg = sw.DEFAULT_CONFIG
+
+    def _page(self, domain, html):
+        fp = sw.Fingerprint(domain=domain, fetched=True, http_status=200)
+        sw.score_html(fp, html)
+        return fp
+
+    def test_repair_business_is_not_reported(self):
+        fp = self._page("pcwatchdogs.com",
+                        "<p>Is your computer infected? We remove viruses and "
+                        "use AnyDesk for remote sessions. About Us. Our "
+                        "services. Opening hours: Mon-Fri. Privacy policy. "
+                        "Customer reviews. Call +1 405 655 8324 for a quote.</p>")
+        self.assertTrue(fp.looks_like_a_business)
+        self.assertFalse(sw.should_confirm(fp, self.cfg))
+
+    def test_blog_post_about_malware_is_not_reported(self):
+        fp = self._page("prashantkumar96.wordpress.com",
+                        "<p>Posted on my WordPress blog. Explaining the "
+                        "'virus detected' and 'your pc is infected' popups. "
+                        "Leave a reply. Related posts. Read more.</p>")
+        self.assertTrue(fp.looks_editorial)
+        self.assertFalse(sw.should_confirm(fp, self.cfg))
+
+    def test_vendor_advisory_is_not_reported(self):
+        fp = self._page("example-vendor.com",
+                        "<p>Threat research: invoice phishing campaign "
+                        "leveraging AnyDesk. Indicators of compromise below. "
+                        "Published on. Related articles.</p>")
+        self.assertTrue(fp.looks_editorial)
+        self.assertFalse(sw.should_confirm(fp, self.cfg))
+
+    def test_actual_scam_page_still_confirms(self):
+        fp = self._page("evil-alert.sbs",
+                        "<h1>Windows Defender: Virus detected</h1><p>Your "
+                        "computer is infected. Do not restart your PC. Call "
+                        "immediately 1-833-555-0142 and download AnyDesk so a "
+                        "technician can share your screen.</p>")
+        self.assertFalse(fp.looks_editorial)
+        self.assertFalse(fp.looks_like_a_business)
+        self.assertTrue(sw.should_confirm(fp, self.cfg))
+
+    def test_a_single_incidental_signal_does_not_veto(self):
+        """One "privacy policy" link must not exempt a scam page."""
+        fp = self._page("evil-alert.sbs",
+                        "<h1>Virus detected</h1><p>Your computer is infected. "
+                        "Do not restart. Call 1-833-555-0142, install AnyDesk. "
+                        "<a href='/privacy'>Privacy policy</a></p>")
+        self.assertFalse(fp.looks_like_a_business)
+        self.assertTrue(sw.should_confirm(fp, self.cfg))
+
+    def test_veto_thresholds_are_named_constants(self):
+        self.assertGreaterEqual(sw.EDITORIAL_VETO, 2)
+        self.assertGreaterEqual(sw.BUSINESS_VETO, 2)
+
+
 class TestUrlscanDateFilter(unittest.TestCase):
     """
     urlscan's index reaches back years; these pages live for hours. Of 14

@@ -54,6 +54,9 @@ UA = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) scamwatch/{VERSION} (+abuse-int
 MAX_BODY_BYTES = 2_000_000
 # Consecutive crt.sh failures after which the rest of the pass gives up on it.
 CT_FAILURE_LIMIT = 5
+# How many editorial / business signals veto a confirmation.
+EDITORIAL_VETO = 2
+BUSINESS_VETO = 3
 # A marker at or above this weight is "strong": it describes something only a
 # scam page does, rather than vocabulary a legitimate security page also uses.
 STRONG_MARKER_MIN_WEIGHT = 3
@@ -266,6 +269,47 @@ PARKING_MARKERS: List[str] = [
     "namesilo parking", "cashparking", "domain broker",
 ]
 
+# --- Negative signals -------------------------------------------------------
+# The content markers describe a TOPIC, not an INTENT, and that is not enough
+# on its own. Measured against 98 live pages, topic-only scoring confirmed
+# seven and every one was a false positive: two blog posts about malware, a
+# security vendor's advisory on AnyDesk phishing, and four genuine computer
+# repair businesses. All of them legitimately say "your computer is infected"
+# and "we use AnyDesk".
+#
+# What separates them from a scam page is not vocabulary but framing. An
+# article discusses the subject; a business advertises a service; a scam page
+# asserts a detection about you, right now, and demands you call. These two
+# lists capture the first two, and veto them.
+
+# Pages ABOUT scams and malware: blogs, guides, vendor advisories, news.
+EDITORIAL_MARKERS: List[str] = [
+    "wordpress", "posted on", "published on", "last updated on",
+    "leave a reply", "leave a comment", "comments are closed", "post comment",
+    "read more", "continue reading", "share this", "related posts",
+    "related articles", "recent posts", "subscribe to our newsletter",
+    "table of contents", "in this article", "in this guide",
+    "comprehensive guide", "step-by-step guide", "how to get",
+    "threat research", "security research", "indicators of compromise",
+    "vulnerability", "malware analysis", "proof of concept",
+    "permalink", "rss feed", "author:", "categories:", "filed under",
+]
+
+# Pages advertising a real service: local IT shops, MSPs, repair businesses.
+BUSINESS_MARKERS: List[str] = [
+    "impressum", "datenschutz", "mwst", "uid-nr", "vat number",
+    "company number", "registered office", "abn ", "acn ",
+    "opening hours", "business hours", "öffnungszeiten",
+    "horaires", "our services", "unsere leistungen", "nos services",
+    "nuestros servicios", "servicios", "about us", "über uns",
+    "sobre nosotros", "à propos", "our team", "meet the team",
+    "privacy policy", "terms of service", "terms and conditions",
+    "cookie policy", "google maps", "find us", "our address",
+    "book an appointment", "make an appointment", "termin vereinbaren",
+    "years of experience", "customer reviews", "testimonials",
+    "pricing", "preise", "tarifs", "precios", "quote", "free estimate",
+]
+
 # Bank / brand names whose presence on a non-allowlisted domain is a strong
 # impersonation signal. Matched with word boundaries only.
 BRAND_MARKERS: List[str] = [
@@ -360,6 +404,8 @@ def compile_markers() -> List[Tuple[str, int, re.Pattern]]:
 
 
 COMPILED_PARKING = [re.compile(re.escape(m)) for m in PARKING_MARKERS]
+COMPILED_EDITORIAL = [(m, re.compile(re.escape(m))) for m in EDITORIAL_MARKERS]
+COMPILED_BUSINESS = [(m, re.compile(re.escape(m))) for m in BUSINESS_MARKERS]
 COMPILED_MARKERS = compile_markers()
 STRONG_MARKERS = frozenset(
     text for text, weight in CONTENT_MARKERS if weight >= STRONG_MARKER_MIN_WEIGHT)
@@ -942,6 +988,8 @@ class Fingerprint:
     http_status: int = 0
     fetched: bool = False
     parked: bool = False
+    editorial: List[str] = field(default_factory=list)
+    business: List[str] = field(default_factory=list)
     error: str = ""
     # Where the scored content came from: "live" (we fetched the page) or
     # "urlscan-archive" (the page was gone; urlscan's saved DOM was scored).
@@ -958,6 +1006,16 @@ class Fingerprint:
     def served_ok(self) -> bool:
         """True only when the server actually returned a page (2xx)."""
         return 200 <= self.http_status < 300
+
+    @property
+    def looks_editorial(self) -> bool:
+        """An article or advisory about scams, rather than a scam."""
+        return len(self.editorial) >= EDITORIAL_VETO
+
+    @property
+    def looks_like_a_business(self) -> bool:
+        """A real service provider advertising itself."""
+        return len(self.business) >= BUSINESS_VETO
 
     @property
     def strong_markers(self) -> List[str]:
@@ -1168,6 +1226,13 @@ def score_html(fp: Fingerprint, html: str) -> None:
         if pattern.search(lowered):
             fp.brands.append(brand)
             fp.content_score += 2
+
+    for text, pattern in COMPILED_EDITORIAL:
+        if pattern.search(lowered):
+            fp.editorial.append(text)
+    for text, pattern in COMPILED_BUSINESS:
+        if pattern.search(lowered):
+            fp.business.append(text)
 
     fp.phones = extract_phones(html)
     if fp.phones:
@@ -1669,6 +1734,13 @@ def should_confirm(fp: Fingerprint, cfg: Dict) -> bool:
     # destined for abuse, but nothing is being served and an abuse desk has
     # nothing to act on.
     if fp.parked:
+        return False
+
+    # Vocabulary alone cannot tell a scam from an article about scams or from
+    # a repair shop's advertising - measured, that mistake was 7 for 7. A page
+    # that carries the furniture of publishing or of a real business is not
+    # written up, whatever its topic score.
+    if fp.looks_editorial or fp.looks_like_a_business:
         return False
     if fp.phones and fp.has_remote_tool:
         return True

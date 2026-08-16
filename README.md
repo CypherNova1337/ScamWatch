@@ -241,6 +241,16 @@ urlscan link in the report. The `.eml` is a draft, not a verdict.
 - **Registrable-domain detection uses a bundled suffix list**, not the full
   Public Suffix List. It is accurate for the TLDs in `MULTI_PART_SUFFIXES` and
   falls back to last-two-labels elsewhere.
+- **Scoring describes a topic, and a topic is not an intent.** This is the
+  detector's central weakness and it was measured, not guessed. Scored against
+  98 live pages, topic-only matching confirmed seven — and all seven were
+  false positives: two blog posts about malware, a security vendor's advisory
+  on AnyDesk phishing, and four genuine computer repair businesses. Every one
+  of them legitimately says "your computer is infected" and "we use AnyDesk".
+  Editorial and business signals now veto those pages, but the underlying
+  limitation stands: matching vocabulary cannot by itself distinguish a scam
+  page from a page about scams. **Treat every generated report as a lead to
+  verify, never as a verdict**, and read the page before you send anything.
 - **Scoring is heuristic.** It is tuned to be specific rather than sensitive.
   Expect to miss pages that are pure image or that render entirely via
   JavaScript — there is no browser here, only an HTTP GET.
