@@ -211,6 +211,19 @@ redirects that urlscan's public corpus underrepresents.
 Treat `review` notes as leads and `confirmed` reports as drafts. Read the page
 before you send anything.
 
+### What the urlscan tier does and does not allow
+
+With a free account key, **reading** a scan's verdict works — verified live,
+returning `malicious`, `score=100` and `tag=phishing` on real phishing pages —
+so corroboration functions as designed. **Searching** on verdict fields
+(`verdicts.overall.malicious`, `verdicts.overall.tags`) returns HTTP 403,
+`"Your current plan does not allow you to search field ..."`. So urlscan's
+judgement can confirm a candidate this tool already found, but cannot be used
+to go looking for candidates. That is why corroboration is applied at scoring
+time rather than as a search filter, and it is the reason no corroborated
+tech-support scam could be exhibited during development: the queries that
+would find one directly are gated behind a paid plan.
+
 ## Operating notes — read before you send anything
 
 **Nothing is ever mailed automatically.** The tool writes drafts. A human reads
