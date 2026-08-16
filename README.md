@@ -89,10 +89,20 @@ more corpses than evidence, and it warns you when it does.
 
 ## What comes out
 
+Findings land in one of two tiers. **This tool never addresses an abuse report
+on its own reading of a page** — see Precision below for the measurement that
+forced that rule.
+
+| Tier | Requires | Output |
+|---|---|---|
+| `confirmed` | content gate **and** an independent signal (urlscan verdict, phishing-feed listing) | full report + addressed `.eml` |
+| `review` | content gate only | short note in `out/review/`, no draft |
+
 In `out/`:
 
 - `<ts>_<domain>.md` — full evidence report per confirmed domain
 - `<ts>_<domain>.eml` — addressed, ready-to-review abuse-desk draft
+- `review/<ts>_<domain>.md` — an uncorroborated lead for a human to check
 - `scamwatch.csv` — one row per confirmation, the campaign timeline
 - `iocs_phones.csv` — **the master IOC sheet**: every extracted number, first
   and last seen, and every domain it appeared on
@@ -170,9 +180,36 @@ Keys worth knowing:
 - `allowlist` — **read this before tuning anything else** (below)
 - `vendor_labels` — brand labels exempt on any TLD, so a vendor's ccTLD sites
   are never reported
-- `confirm_threshold` — **content** score needed before a report is written.
-  The domain-name heuristic is scored separately and deliberately excluded
+- `confirm_threshold` — **content** score needed to pass the content gate. The
+  domain-name heuristic is scored separately and deliberately excluded
+- `require_corroboration` — default `true`. Turning it off means mailing abuse
+  desks on this tool's own reading of a page, which measured 0/7
 - `reporter_from`, `reporter_org` — your identity, stamped into `.eml` drafts
+
+## Precision, as measured
+
+Scored against 98 live pages pulled from urlscan, with each gate added in turn:
+
+| Gate | Pages it would have reported | True positives |
+|---|---|---|
+| Content markers only | 7 | **0** |
+| \+ editorial / business veto | 3 | **0** |
+| \+ corroboration required | **0** | — |
+
+The seven were two blog posts about malware, a security vendor's advisory on
+AnyDesk phishing, and four genuine computer repair businesses. Every one of
+them legitimately says "your computer is infected" and "we use AnyDesk". Run
+as originally written, the tool would have mailed abuse desks about all seven.
+
+Two conclusions are baked into the current design. Vocabulary identifies a
+topic and cannot establish intent, so the content gate is necessary but never
+sufficient. And **no true positive has yet been observed**, so the detector's
+real hit rate is unknown — the sample may simply have contained none, since
+live tech-support pages are short-lived and often sit behind malvertising
+redirects that urlscan's public corpus underrepresents.
+
+Treat `review` notes as leads and `confirmed` reports as drafts. Read the page
+before you send anything.
 
 ## Operating notes — read before you send anything
 
