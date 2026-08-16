@@ -231,6 +231,10 @@ DEFAULT_CONFIG: Dict = {
     "reporter_org": "",
     # Score a domain must reach before a report package is written.
     "confirm_threshold": 6,
+    # Require an independent signal (urlscan verdict, phishing-feed listing)
+    # before writing an addressed abuse report. Turning this off means mailing
+    # abuse desks on this tool's own reading of a page, which measured 0/7.
+    "require_corroboration": True,
     # Score a domain must reach to be kept as a noteworthy candidate.
     "threshold": 4,
 }
@@ -990,6 +994,9 @@ class Fingerprint:
     parked: bool = False
     editorial: List[str] = field(default_factory=list)
     business: List[str] = field(default_factory=list)
+    # Independent signals that someone other than this tool considers the
+    # domain malicious. Our own scoring is never sufficient on its own.
+    corroboration: List[str] = field(default_factory=list)
     error: str = ""
     # Where the scored content came from: "live" (we fetched the page) or
     # "urlscan-archive" (the page was gone; urlscan's saved DOM was scored).
@@ -1006,6 +1013,10 @@ class Fingerprint:
     def served_ok(self) -> bool:
         """True only when the server actually returned a page (2xx)."""
         return 200 <= self.http_status < 300
+
+    @property
+    def corroborated(self) -> bool:
+        return bool(self.corroboration)
 
     @property
     def looks_editorial(self) -> bool:
@@ -1315,6 +1326,41 @@ def fingerprint_archive(sess: requests.Session, domain: str, uuid: str,
 # --------------------------------------------------------------------------
 # attribution
 # --------------------------------------------------------------------------
+def urlscan_verdict(sess: requests.Session, uuid: str, api_key: str,
+                    timeout: int = 30) -> List[str]:
+    """
+    Ask urlscan what IT thinks of a scan, as an independent opinion.
+
+    Our own scoring cannot separate a scam page from a repair shop that
+    advertises the same services - measured, that mistake was 7 for 7. An
+    outside verdict is what makes a confirmation more than this tool agreeing
+    with itself.
+    """
+    if not (uuid and api_key):
+        return []
+    try:
+        resp = sess.get(f"https://urlscan.io/api/v1/result/{uuid}/",
+                        headers={"API-Key": api_key}, timeout=timeout)
+        if resp.status_code != 200:
+            return []
+        overall = (resp.json().get("verdicts") or {}).get("overall") or {}
+    except (requests.RequestException, ValueError) as exc:
+        log.debug("urlscan verdict %s failed: %s", uuid, exc)
+        return []
+
+    signals: List[str] = []
+    if overall.get("malicious"):
+        signals.append("urlscan:malicious")
+    score = overall.get("score")
+    if isinstance(score, (int, float)) and score > 0:
+        signals.append(f"urlscan:score={int(score)}")
+    for brand in (overall.get("brands") or [])[:4]:
+        signals.append(f"urlscan:brand={brand}")
+    for tag in (overall.get("tags") or [])[:4]:
+        signals.append(f"urlscan:tag={tag}")
+    return signals
+
+
 def rdap(sess: requests.Session, url: str) -> Dict:
     try:
         resp = sess.get(url, timeout=20)
@@ -1641,6 +1687,42 @@ def write_ioc_sheet(store: Store, path: Path) -> None:
                              row["domains"], row["hits"]])
 
 
+def write_review_note(domain: str, fp: Fingerprint, source: str,
+                      outdir: Path) -> None:
+    """
+    Record a lead that nobody else has corroborated.
+
+    Deliberately not an addressed abuse draft: the content gate alone cannot
+    tell a scam page from a repair shop advertising the same service, so these
+    are for a human to look at, not to send.
+    """
+    review_dir = outdir / "review"
+    review_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    slug = re.sub(r"[^a-z0-9.-]", "_", domain)[:80]
+    quoted = requests.utils.quote(domain)
+    (review_dir / f"{timestamp}_{slug}.md").write_text(f"""# Needs review - {domain}
+
+Content markers fired, but no independent source corroborates this. It is a
+lead, not a finding. Open the page (or the urlscan link) before acting.
+
+- Source: {source}
+- Evidence: {_evidence_line(fp)}
+- Content score: {fp.content_score}
+- Strong markers: {', '.join(fp.strong_markers) or 'none'}
+- All markers: {', '.join(fp.markers[:12]) or 'none'}
+- Phones: {', '.join(fp.phones) or 'none'}
+- Editorial signals: {len(fp.editorial)}   Business signals: {len(fp.business)}
+- Page title: {fp.title or 'n/a'}
+
+Check first: https://urlscan.io/search/#page.domain%3A%22{quoted}%22
+
+If this is a genuine scam page, corroborate it (submit it to urlscan, check a
+phishing feed) and it will be picked up as a confirmation on a later pass.
+""", encoding="utf-8")
+    log.info("review note written for %s (uncorroborated)", domain)
+
+
 def write_reports(sess: requests.Session, domain: str, fp: Fingerprint,
                   source: str, outdir: Path, cfg: Dict) -> Attribution:
     att = attribute(sess, domain, fp, cfg)
@@ -1718,7 +1800,7 @@ def collect_candidates(args, cfg: Dict, store: Store, api: requests.Session,
     return candidates, healths
 
 
-def should_confirm(fp: Fingerprint, cfg: Dict) -> bool:
+def passes_content_gate(fp: Fingerprint, cfg: Dict) -> bool:
     """
     Gate on evidence the page actually served, never on the name.
 
@@ -1758,6 +1840,29 @@ def should_confirm(fp: Fingerprint, cfg: Dict) -> bool:
     return fp.content_score >= cfg["confirm_threshold"]
 
 
+def should_confirm(fp: Fingerprint, cfg: Dict) -> bool:
+    """
+    Whether to generate an addressed abuse report.
+
+    Requires the content gate AND an independent opinion. Across 98 live
+    pages the content gate alone confirmed only false positives - legitimate
+    repair shops advertise the same services in the same words that a scam
+    page uses. Reporting a real business to its registrar can take it
+    offline, so this tool never mails anyone purely on its own reading of a
+    page. Set require_corroboration false to accept that risk knowingly.
+    """
+    if not passes_content_gate(fp, cfg):
+        return False
+    if cfg.get("require_corroboration", True) and not fp.corroborated:
+        return False
+    return True
+
+
+def needs_review(fp: Fingerprint, cfg: Dict) -> bool:
+    """Content looks wrong but nobody else has said so: a lead, not a verdict."""
+    return passes_content_gate(fp, cfg) and not should_confirm(fp, cfg)
+
+
 def run_once(args, cfg: Dict, store: Store, api: requests.Session,
              probe: requests.Session) -> None:
     candidates, healths = collect_candidates(args, cfg, store, api)
@@ -1776,6 +1881,7 @@ def run_once(args, cfg: Dict, store: Store, api: requests.Session,
     api_key = os.environ.get("URLSCAN_API_KEY", "")
     use_archive = bool(cfg.get("urlscan_use_archive", True)) and bool(api_key)
     revived = 0
+    review = 0
 
     confirmed = 0
     for domain, cand in sorted(candidates.items()):
@@ -1810,8 +1916,25 @@ def run_once(args, cfg: Dict, store: Store, api: requests.Session,
                 fp = archived
                 revived += 1
 
+        # A phishing feed listing someone else's judgement is corroboration.
+        if source.startswith("feed:"):
+            fp.corroboration.append(source)
+        if cand.urlscan_uuid and api_key:
+            fp.corroboration.extend(
+                urlscan_verdict(api, cand.urlscan_uuid, api_key))
+
         store.upsert(domain, source, "candidate", fp.score,
                      ",".join(fp.phones), ";".join(fp.markers[:12]))
+
+        if needs_review(fp, cfg):
+            review += 1
+            store.upsert(domain, source, "review", fp.score,
+                         ",".join(fp.phones), ";".join(fp.markers[:12]))
+            if not args.dry_run:
+                write_review_note(domain, fp, source, args.out)
+            else:
+                log.info("[dry-run] would flag %s for review (score %d)",
+                         domain, fp.content_score)
 
         if should_confirm(fp, cfg):
             confirmed += 1
@@ -1833,8 +1956,9 @@ def run_once(args, cfg: Dict, store: Store, api: requests.Session,
     if not args.no_fingerprint and not use_archive:
         log.warning("no URLSCAN_API_KEY: archived-evidence fallback disabled, so "
                     "candidates whose page is already gone cannot be confirmed")
-    log.info("pass complete: %d candidates, %d confirmed%s (reports in %s)",
-             len(candidates), confirmed,
+    log.info("pass complete: %d candidates, %d confirmed, %d flagged for "
+             "review%s (output in %s)",
+             len(candidates), confirmed, review,
              f", {revived} via archived evidence" if revived else "",
              args.out)
 

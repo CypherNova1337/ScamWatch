@@ -264,7 +264,7 @@ class TestConfirmationGate(unittest.TestCase):
         fp = sw.Fingerprint(domain="x.sbs", content_score=5, fetched=True,
                             http_status=200, markers=["anydesk"],
                             phones=["+18335550142"])
-        self.assertTrue(sw.should_confirm(fp, self.cfg))
+        self.assertTrue(sw.passes_content_gate(fp, self.cfg))
 
     def test_weak_markers_cannot_stack_to_a_confirmation(self):
         """
@@ -286,7 +286,7 @@ class TestConfirmationGate(unittest.TestCase):
                             http_status=200,
                             markers=["virus detected", "security alert"])
         self.assertIn("virus detected", fp.strong_markers)
-        self.assertTrue(sw.should_confirm(fp, self.cfg))
+        self.assertTrue(sw.passes_content_gate(fp, self.cfg))
 
     def test_strong_marker_set_is_weight_derived(self):
         self.assertIn("anydesk", sw.STRONG_MARKERS)
@@ -298,7 +298,7 @@ class TestConfirmationGate(unittest.TestCase):
         fp = sw.Fingerprint(domain="x.sbs", content_score=12, fetched=True,
                             http_status=200,
                             markers=["virus detected", "call immediately"])
-        self.assertTrue(sw.should_confirm(fp, self.cfg))
+        self.assertTrue(sw.passes_content_gate(fp, self.cfg))
 
     def test_score_is_the_sum_of_both_halves(self):
         fp = sw.Fingerprint(domain="x.sbs", heuristic_score=3, content_score=4)
@@ -551,7 +551,7 @@ class TestParkedPages(unittest.TestCase):
         sw.score_html(fp, "<p>Virus detected. Call 1-833-555-0142 and "
                           "install AnyDesk.</p>")
         self.assertFalse(fp.parked)
-        self.assertTrue(sw.should_confirm(fp, sw.DEFAULT_CONFIG))
+        self.assertTrue(sw.passes_content_gate(fp, sw.DEFAULT_CONFIG))
 
 
 class TestTopicVersusIntent(unittest.TestCase):
@@ -605,7 +605,7 @@ class TestTopicVersusIntent(unittest.TestCase):
                         "technician can share your screen.</p>")
         self.assertFalse(fp.looks_editorial)
         self.assertFalse(fp.looks_like_a_business)
-        self.assertTrue(sw.should_confirm(fp, self.cfg))
+        self.assertTrue(sw.passes_content_gate(fp, self.cfg))
 
     def test_a_single_incidental_signal_does_not_veto(self):
         """One "privacy policy" link must not exempt a scam page."""
@@ -614,11 +614,92 @@ class TestTopicVersusIntent(unittest.TestCase):
                         "Do not restart. Call 1-833-555-0142, install AnyDesk. "
                         "<a href='/privacy'>Privacy policy</a></p>")
         self.assertFalse(fp.looks_like_a_business)
-        self.assertTrue(sw.should_confirm(fp, self.cfg))
+        self.assertTrue(sw.passes_content_gate(fp, self.cfg))
 
     def test_veto_thresholds_are_named_constants(self):
         self.assertGreaterEqual(sw.EDITORIAL_VETO, 2)
         self.assertGreaterEqual(sw.BUSINESS_VETO, 2)
+
+
+class TestCorroborationPolicy(unittest.TestCase):
+    """
+    Across 98 live pages the content gate alone confirmed only false
+    positives. This tool must never mail an abuse desk purely on its own
+    reading of a page.
+    """
+
+    def setUp(self):
+        self.cfg = sw.DEFAULT_CONFIG
+        self.fp = sw.Fingerprint(
+            domain="evil.sbs", content_score=12, fetched=True, http_status=200,
+            markers=["anydesk", "virus detected"], phones=["+18335550142"])
+
+    def test_content_gate_alone_is_a_review_lead_not_a_report(self):
+        self.assertTrue(sw.passes_content_gate(self.fp, self.cfg))
+        self.assertFalse(sw.should_confirm(self.fp, self.cfg))
+        self.assertTrue(sw.needs_review(self.fp, self.cfg))
+
+    def test_outside_verdict_promotes_it(self):
+        self.fp.corroboration.append("urlscan:malicious")
+        self.assertTrue(sw.should_confirm(self.fp, self.cfg))
+        self.assertFalse(sw.needs_review(self.fp, self.cfg))
+
+    def test_feed_listing_counts_as_corroboration(self):
+        self.fp.corroboration.append("feed:openphish")
+        self.assertTrue(sw.should_confirm(self.fp, self.cfg))
+
+    def test_corroboration_cannot_rescue_a_failed_content_gate(self):
+        shop = sw.Fingerprint(domain="repair.ch", content_score=9,
+                              fetched=True, http_status=200,
+                              markers=["anydesk"],
+                              business=["impressum", "our services",
+                                        "opening hours"],
+                              corroboration=["urlscan:malicious"])
+        self.assertFalse(sw.should_confirm(shop, self.cfg))
+
+    def test_policy_can_be_disabled_knowingly(self):
+        cfg = dict(self.cfg, require_corroboration=False)
+        self.assertTrue(sw.should_confirm(self.fp, cfg))
+
+
+class TestUrlscanVerdict(unittest.TestCase):
+    class FakeSession:
+        def __init__(self, status=200, payload=None):
+            self.status, self.payload = status, payload or {}
+
+        def get(self, url, headers=None, timeout=None, **kw):
+            outer = self
+
+            class R:
+                status_code = outer.status
+
+                def json(self):
+                    return outer.payload
+            return R()
+
+    def test_extracts_malicious_score_and_brands(self):
+        sess = self.FakeSession(200, {"verdicts": {"overall": {
+            "malicious": True, "score": 70, "brands": ["Microsoft"],
+            "tags": ["phishing"]}}})
+        signals = sw.urlscan_verdict(sess, "u", "key")
+        self.assertIn("urlscan:malicious", signals)
+        self.assertIn("urlscan:score=70", signals)
+        self.assertIn("urlscan:brand=Microsoft", signals)
+        self.assertIn("urlscan:tag=phishing", signals)
+
+    def test_clean_verdict_yields_nothing(self):
+        sess = self.FakeSession(200, {"verdicts": {"overall": {
+            "malicious": False, "score": 0, "brands": [], "tags": []}}})
+        self.assertEqual(sw.urlscan_verdict(sess, "u", "key"), [])
+
+    def test_requires_uuid_and_key(self):
+        sess = self.FakeSession(200, {})
+        self.assertEqual(sw.urlscan_verdict(sess, "", "key"), [])
+        self.assertEqual(sw.urlscan_verdict(sess, "u", ""), [])
+
+    def test_http_error_is_not_fatal(self):
+        sess = self.FakeSession(403, {})
+        self.assertEqual(sw.urlscan_verdict(sess, "u", "key"), [])
 
 
 class TestUrlscanDateFilter(unittest.TestCase):
@@ -680,7 +761,7 @@ class TestArchiveFallback(unittest.TestCase):
         self.assertEqual(fp.evidence_ref, "uuid-1")
         self.assertIn("anydesk", fp.markers)
         self.assertIn("+18335550142", fp.phones)
-        self.assertTrue(sw.should_confirm(fp, sw.DEFAULT_CONFIG))
+        self.assertTrue(sw.passes_content_gate(fp, sw.DEFAULT_CONFIG))
 
     def test_sends_the_api_key(self):
         sess = self.FakeSession(200, self.SCAM_DOM)
