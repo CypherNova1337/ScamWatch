@@ -1,0 +1,13 @@
+# runtime state and output
+scamwatch.db
+scamwatch.json
+out/
+*.eml
+*.csv
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/

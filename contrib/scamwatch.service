@@ -1,0 +1,29 @@
+# /etc/systemd/system/scamwatch.service
+[Unit]
+Description=ScamWatch takedown watcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/scamwatch
+ExecStart=/usr/bin/python3 /opt/scamwatch/scamwatch.py --loop --interval 300 \
+          --out /var/lib/scamwatch/out --db /var/lib/scamwatch/scamwatch.db \
+          --config /etc/scamwatch/scamwatch.json
+Restart=always
+RestartSec=30
+StateDirectory=scamwatch
+Environment=URLSCAN_API_KEY=
+
+# hardening: it only needs outbound HTTPS and its own state directory
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+ReadWritePaths=/var/lib/scamwatch
+
+[Install]
+WantedBy=multi-user.target
