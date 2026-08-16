@@ -67,6 +67,49 @@ class TestAllowlist(unittest.TestCase):
         self.assertFalse(sw.is_allowlisted("microsoft.com.evil.sbs", self.allow))
 
 
+class TestVendorLabelAllowlist(unittest.TestCase):
+    """
+    Regression, observed live: a broad crt.sh term returned teamviewer.cn and
+    five of its subdomains. That is TeamViewer's real China operation, and a
+    genuine TeamViewer page trips teamviewer + remote control + session id =
+    7, over the confirmation threshold. Without this rule the tool would have
+    filed an abuse report against the vendor's own site.
+    """
+
+    def setUp(self):
+        self.allow = {d.lower() for d in sw.DEFAULT_CONFIG["allowlist"]}
+        self.vendors = {v.lower() for v in sw.DEFAULT_CONFIG["vendor_labels"]}
+
+    def _check(self, domain):
+        return sw.is_allowlisted(domain, self.allow, self.vendors)
+
+    def test_vendor_brand_on_any_tld_is_exempt(self):
+        for domain in ("teamviewer.cn", "dl.teamviewer.cn",
+                       "rlb.router.teamviewer.cn", "anydesk.de",
+                       "microsoft.co.jp", "norton.com.au"):
+            with self.subTest(domain=domain):
+                self.assertTrue(self._check(domain))
+
+    def test_lookalikes_still_pass_through(self):
+        for domain in ("anydesk--app.online", "anydesk--pro.online",
+                       "www.anydesk-win.y--a--hoo.com",
+                       "anydesk-wake-on-lan--458392.steinengel.de",
+                       "windows-defender-security-center--642456696.borsan.de",
+                       "live-support-defender.sbs"):
+            with self.subTest(domain=domain):
+                self.assertFalse(self._check(domain))
+
+    def test_brand_must_be_the_whole_label(self):
+        """"anydesk-app.x" is not "anydesk.x" - only an exact label exempts."""
+        self.assertFalse(self._check("anydesk-app.online"))
+        self.assertFalse(self._check("myteamviewer.net"))
+        self.assertFalse(self._check("teamviewer-support.sbs"))
+
+    def test_omitting_vendor_labels_preserves_old_behaviour(self):
+        self.assertFalse(sw.is_allowlisted("teamviewer.cn", self.allow))
+        self.assertTrue(sw.is_allowlisted("teamviewer.com", self.allow))
+
+
 class TestValidDomain(unittest.TestCase):
     def test_accepts_normal(self):
         self.assertTrue(sw.valid_domain("live-support.sbs"))

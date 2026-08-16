@@ -151,6 +151,8 @@ Keys worth knowing:
   with `ETag`/`If-Modified-Since`, so a `--loop` at 300s does not re-pull them
   on every pass
 - `allowlist` — **read this before tuning anything else** (below)
+- `vendor_labels` — brand labels exempt on any TLD, so a vendor's ccTLD sites
+  are never reported
 - `confirm_threshold` — **content** score needed before a report is written.
   The domain-name heuristic is scored separately and deliberately excluded
 - `reporter_from`, `reporter_org` — your identity, stamped into `.eml` drafts
@@ -167,6 +169,18 @@ its registrar can take a real site offline. Three guards exist:
    `.mil` / `.police.uk`-class suffix are never reported, regardless of what a
    keyword search turns up — `%windows-defender%` on crt.sh matches genuine
    Microsoft certificates. Extend `allowlist` freely; it is cheap insurance.
+
+   `vendor_labels` handles the harder half. Vendors run their brand across
+   many ccTLDs and an exact-domain list cannot keep up: a live pass returned
+   `teamviewer.cn` and five of its subdomains, which is TeamViewer's real
+   China operation — and a genuine TeamViewer page trips
+   `teamviewer` + `remote control` + `session id` = 7, clearing the gate on
+   its own. Anything whose registrable label *is* a vendor brand is exempt on
+   any TLD. The cost is a miss if someone registers a brand exactly
+   (`teamviewer.xyz`); the benefit is never mailing an abuse desk about the
+   vendor's own site. Lookalikes do not use the bare label —
+   `anydesk--app.online` and `anydesk-win.y--a--hoo.com` both still come
+   through.
 2. **Confirmation requires served content.** Each candidate carries two
    separate scores: a *name heuristic* (ranking hint) and a *content score*
    (what the server actually served). Only the content score is compared

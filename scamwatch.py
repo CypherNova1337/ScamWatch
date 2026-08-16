@@ -181,6 +181,23 @@ DEFAULT_CONFIG: Dict = {
         "letsencrypt.org", "digicert.com", "sectigo.com", "identrust.com",
         "urlscan.io", "virustotal.com", "abuse.ch", "shodan.io",
     ],
+    # Brand labels that identify a vendor's own site on ANY TLD, e.g.
+    # teamviewer.cn as well as teamviewer.com. Matched against the registrable
+    # label exactly, so lookalikes like "anydesk--app.online" are unaffected.
+    # Deliberately limited to software vendors, which run many ccTLDs; banks
+    # are listed as exact domains in `allowlist` instead.
+    "vendor_labels": [
+        "microsoft", "windows", "windowsupdate", "office", "office365",
+        "microsoftonline", "azure", "skype", "xbox", "msn",
+        "anydesk", "teamviewer", "connectwise", "screenconnect", "logmein",
+        "gotoassist", "splashtop", "rustdesk", "ultraviewer", "supremo",
+        "norton", "nortonlifelock", "mcafee", "avast", "avg", "malwarebytes",
+        "bitdefender", "kaspersky", "eset", "trendmicro", "sophos",
+        "crowdstrike", "webroot", "avira",
+        "google", "apple", "amazon", "cloudflare", "mozilla", "adobe",
+        "paypal", "ebay", "netflix", "dropbox", "zoom",
+        "letsencrypt", "digicert", "sectigo", "urlscan", "virustotal",
+    ],
     # Reporter identity stamped into the .eml drafts. Set this before sending.
     "reporter_from": "",
     "reporter_org": "",
@@ -345,7 +362,8 @@ def registrable_domain(domain: str) -> str:
     return ".".join(parts[-2:])
 
 
-def is_allowlisted(domain: str, allowlist: Set[str]) -> bool:
+def is_allowlisted(domain: str, allowlist: Set[str],
+                   vendor_labels: Optional[Set[str]] = None) -> bool:
     domain = domain.lower().strip(".")
     if domain.endswith(PROTECTED_SUFFIXES):
         return True
@@ -354,6 +372,24 @@ def is_allowlisted(domain: str, allowlist: Set[str]) -> bool:
     reg = registrable_domain(domain)
     if reg in allowlist:
         return True
+
+    # Vendors run their brand on many ccTLDs, and an allowlist of exact
+    # domains cannot keep up: teamviewer.cn is TeamViewer's real China site,
+    # and a genuine TeamViewer page trips enough content markers to clear the
+    # confirmation gate on its own. So exempt anything whose registrable label
+    # IS the vendor brand, on any TLD.
+    #
+    # The cost is a miss if someone registers a brand exactly (teamviewer.xyz);
+    # the benefit is never filing an abuse report against the vendor's own
+    # site. Lookalikes do not use the bare label - "anydesk--app.online" and
+    # "anydesk-win.y--a--hoo.com" both survive this check - so the trade is
+    # cheap, and it runs the right way round for a tool that mails third
+    # parties.
+    if vendor_labels:
+        label = reg.split(".", 1)[0]
+        if label in vendor_labels:
+            return True
+
     # a subdomain of anything allowlisted
     return any(domain.endswith("." + allowed) for allowed in allowlist)
 
@@ -1390,6 +1426,7 @@ def collect_candidates(args, cfg: Dict, store: Store, api: requests.Session,
                        ) -> Tuple[Dict[str, str], List[SourceHealth]]:
     """Gather new candidate domains from every enabled source."""
     allowlist = {d.lower() for d in cfg["allowlist"]}
+    vendor_labels = {v.lower() for v in cfg.get("vendor_labels", [])}
     candidates: Dict[str, str] = {}
     skipped_allow = 0
 
@@ -1402,7 +1439,7 @@ def collect_candidates(args, cfg: Dict, store: Store, api: requests.Session,
         nonlocal skipped_allow
         if domain in candidates:
             return
-        if is_allowlisted(domain, allowlist):
+        if is_allowlisted(domain, allowlist, vendor_labels):
             skipped_allow += 1
             return
         if not args.force and store.seen(domain):
