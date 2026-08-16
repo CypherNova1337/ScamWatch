@@ -303,6 +303,85 @@ class TestFeedParsing(unittest.TestCase):
         self.assertTrue(all(len(m) >= 4 for m in matchers))
 
 
+class TestCtRefinement(unittest.TestCase):
+    """
+    Broad crt.sh terms are a workaround for the service degrading on selective
+    patterns, so the local refinement is what keeps results specific.
+    """
+
+    ROWS = [
+        {"entry_timestamp": "2026-08-16T10:00:00",
+         "name_value": "1997-defender--94.lpme.co.uk"},          # car dealer
+        {"entry_timestamp": "2026-08-16T09:00:00",
+         "name_value": "windows-defender-alert.sbs"},            # target
+        {"entry_timestamp": "2026-08-16T08:00:00",
+         "name_value": "*.defender-alert-support.click"},        # target
+        {"entry_timestamp": "2026-08-16T07:00:00",
+         "name_value": "sugar-defender-reviews.pages.dev"},      # unrelated
+    ]
+
+    class FakeSession:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def get(self, url, params=None, timeout=None, **kw):
+            rows, outer = self.rows, self
+
+            class R:
+                status_code = 200
+
+                def raise_for_status(self): pass
+
+                def json(self): return rows
+            return R()
+
+    def setUp(self):
+        self._delay = sw.CT_QUERY_DELAY
+        sw.CT_QUERY_DELAY = 0
+
+    def tearDown(self):
+        sw.CT_QUERY_DELAY = self._delay
+
+    def _run(self, require_refine):
+        health = sw.SourceHealth("ct")
+        return list(sw.ct_candidates(
+            self.FakeSession(self.ROWS), ["defender"],
+            ["windows-defender", "defender-alert"], 50, health,
+            require_refine=require_refine)), health
+
+    def test_refinement_gates_out_unrelated_hosts(self):
+        got, health = self._run(True)
+        domains = [d for d, _ in got]
+        self.assertIn("windows-defender-alert.sbs", domains)
+        self.assertIn("defender-alert-support.click", domains)
+        self.assertNotIn("1997-defender--94.lpme.co.uk", domains)
+        self.assertNotIn("sugar-defender-reviews.pages.dev", domains)
+        self.assertEqual(health.yielded, 2)
+
+    def test_source_label_records_the_refined_signature(self):
+        got, _ = self._run(True)
+        labels = dict(got)
+        self.assertEqual(labels["windows-defender-alert.sbs"],
+                         "ct:defender+windows-defender")
+
+    def test_wildcard_prefix_is_stripped(self):
+        domains = [d for d, _ in self._run(True)[0]]
+        self.assertNotIn("*.defender-alert-support.click", domains)
+
+    def test_disabling_refinement_keeps_everything(self):
+        domains = [d for d, _ in self._run(False)[0]]
+        self.assertEqual(len(domains), 4)
+
+    def test_limit_counts_kept_domains_not_rows_scanned(self):
+        """Precision must not cost recall: noise rows must not consume limit."""
+        health = sw.SourceHealth("ct")
+        got = list(sw.ct_candidates(
+            self.FakeSession(self.ROWS), ["defender"],
+            ["windows-defender", "defender-alert"], 2, health,
+            require_refine=True))
+        self.assertEqual(len(got), 2)
+
+
 class TestStoreMeta(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

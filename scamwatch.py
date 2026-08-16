@@ -54,6 +54,8 @@ UA = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) scamwatch/{VERSION} (+abuse-int
 MAX_BODY_BYTES = 2_000_000
 # Consecutive crt.sh failures after which the rest of the pass gives up on it.
 CT_FAILURE_LIMIT = 5
+# Politeness delay between queries to a shared public service.
+CT_QUERY_DELAY = 1.0
 
 
 # --------------------------------------------------------------------------
@@ -71,6 +73,10 @@ DEFAULT_CONFIG: Dict = {
         "livesupport", "livehelp", "live-chat", "tech-support", "helpdesk",
         "remote-support", "virus-alert", "security-alert", "pc-security",
     ],
+    # Require a hostname to match one of ct_keywords/brand_shortcodes below
+    # before it becomes a candidate. Set false to keep everything a broad term
+    # returns (much noisier).
+    "ct_require_refine": True,
     # Local refinement only - these are matched against hostnames already
     # returned by a broad query, never sent to crt.sh directly.
     "ct_keywords": [
@@ -574,8 +580,8 @@ class SourceHealth:
 
 def ct_candidates(sess: requests.Session, query_terms: Sequence[str],
                   refine_keywords: Sequence[str], limit: int,
-                  health: SourceHealth, timeout: int = 60,
-                  ) -> Iterator[Tuple[str, str]]:
+                  health: SourceHealth, require_refine: bool = True,
+                  timeout: int = 60) -> Iterator[Tuple[str, str]]:
     """
     Yield (domain, source_label) for freshly issued certs matching keywords.
 
@@ -630,14 +636,22 @@ def ct_candidates(sess: requests.Session, query_terms: Sequence[str],
                 domain = name.strip().strip(".").lower().lstrip("*.")
                 if not domain or domain in emitted or not valid_domain(domain):
                     continue
-                # crt.sh matches organisation fields too; require the keyword
+                # crt.sh matches organisation fields too; require the term
                 # to actually be in the hostname
                 if keyword not in domain:
+                    continue
+                # A broad term is a cheap way to ask crt.sh a question it can
+                # answer, not a detection in itself - "%defender%" returns Land
+                # Rover dealerships alongside fake AV pages. Refinement is what
+                # makes the result specific, so by default it gates rather than
+                # merely labels. Note `limit` counts domains kept, not rows
+                # scanned, so precision here does not cost recall.
+                refined = next((k for k in refine_keywords if k in domain), "")
+                if require_refine and not refined:
                     continue
                 emitted.add(domain)
                 taken += 1
                 health.yielded += 1
-                refined = next((k for k in refine_keywords if k in domain), "")
                 yield domain, f"ct:{keyword}+{refined}" if refined else f"ct:{keyword}"
         if not rows:
             # crt.sh answers some patterns with an empty array rather than an
@@ -645,7 +659,7 @@ def ct_candidates(sess: requests.Session, query_terms: Sequence[str],
             # which ones are returning nothing at all.
             empty_keywords.append(keyword)
         log.debug("crt.sh %r -> %d rows, %d taken", keyword, len(rows), taken)
-        time.sleep(1)  # be polite to crt.sh
+        time.sleep(CT_QUERY_DELAY)  # be polite to crt.sh
 
     if empty_keywords:
         note = f"{len(empty_keywords)} keywords returned no rows"
@@ -1398,8 +1412,9 @@ def collect_candidates(args, cfg: Dict, store: Store, api: requests.Session,
     if not args.no_ct:
         query_terms = list(cfg.get("ct_query_terms") or cfg["ct_keywords"])
         refine = list(cfg["ct_keywords"]) + list(cfg["brand_shortcodes"])
-        for domain, source in ct_candidates(api, query_terms, refine,
-                                            args.limit, ct_health):
+        for domain, source in ct_candidates(
+                api, query_terms, refine, args.limit, ct_health,
+                require_refine=bool(cfg.get("ct_require_refine", True))):
             consider(domain, source)
 
     if not args.no_urlscan:
