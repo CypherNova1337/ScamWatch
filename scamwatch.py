@@ -1600,6 +1600,34 @@ def _bullets(items: Sequence[str], empty: str = "- none observed") -> str:
     return "\n".join("- " + item for item in items) if items else empty
 
 
+def describe_mechanism(fp: Fingerprint) -> str:
+    """
+    Describe how the page works, claiming only what the markers support.
+
+    Shared by the Markdown report and the email draft so the two can never
+    disagree: a report that overstates its evidence is worth less than no
+    report, and an abuse desk that catches one exaggeration discounts
+    everything that follows it.
+    """
+    if fp.has_remote_tool:
+        return ("The page instructs visitors to install remote-access software "
+                "(AnyDesk / TeamViewer / ConnectWise ScreenConnect) and to hand "
+                "over a remote session, which is the standard tech-support "
+                "fraud pattern.")
+    if fp.impersonates and fp.phones:
+        return (f"The page presents itself as \"{fp.impersonates}\" and directs "
+                "visitors to call the number below. This is the standard entry "
+                "point for tech-support fraud: the call handler then talks the "
+                "victim into granting remote access or making a payment.")
+    if fp.phones:
+        return ("The page presents a fabricated security or billing warning "
+                "together with a telephone number, which is the standard entry "
+                "point for tech-support fraud: the call handler then talks the "
+                "victim into granting remote access or making a payment.")
+    return ("The page presents a fabricated security or billing warning "
+            "designed to panic visitors into contacting the operator.")
+
+
 def _evidence_line(fp: Fingerprint) -> str:
     """State plainly where the scored content came from."""
     if fp.evidence == "urlscan-archive":
@@ -1629,11 +1657,7 @@ def build_markdown(domain: str, fp: Fingerprint, att: Attribution,
 
 ## Summary
 
-The page at `{domain}` presents itself as a technical-support or security
-service and directs visitors to install remote-access software and/or call a
-telephone number. This is the standard delivery pattern for tech-support
-fraud: the caller takes remote control of the victim's machine, displays
-fabricated evidence of infection, and extracts payment or bank credentials.
+{describe_mechanism(fp)}
 
 ## Matched indicators
 
@@ -1708,24 +1732,7 @@ def build_eml(domain: str, fp: Fingerprint, att: Attribution,
     else:
         evidence_note = "direct retrieval of the page"
 
-    # Only claim what the markers actually support. A report that overstates
-    # its evidence is worth less than no report at all, and abuse desks that
-    # catch one exaggeration discount everything that follows it.
-    if fp.has_remote_tool:
-        mechanism = (
-            "The page instructs visitors to install remote-access software\n"
-            "(AnyDesk / TeamViewer / ConnectWise ScreenConnect) and to hand over a\n"
-            "remote session, which is the standard tech-support fraud pattern.")
-    elif fp.phones:
-        mechanism = (
-            "The page presents a fabricated security or billing warning together\n"
-            "with a telephone number, which is the standard entry point for\n"
-            "tech-support fraud: the call handler then talks the victim into\n"
-            "granting remote access or making a payment.")
-    else:
-        mechanism = (
-            "The page presents a fabricated security or billing warning designed\n"
-            "to panic visitors into contacting the operator.")
+    mechanism = describe_mechanism(fp)
     msg.set_content(f"""Hello,
 
 The domain below is serving an active tech-support scam landing page and is

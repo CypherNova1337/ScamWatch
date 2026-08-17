@@ -1101,6 +1101,46 @@ class TestReportRendering(unittest.TestCase):
         bare = body_for(sw.Fingerprint(domain="c.sbs", markers=["virus detected"]))
         self.assertNotIn("AnyDesk / TeamViewer", bare)
 
+    def test_report_and_email_describe_the_same_mechanism(self):
+        """
+        The Markdown summary once asserted remote-access tooling on every
+        page while the email hedged correctly, so a real report claimed
+        AnyDesk on a page whose only markers were Defender branding and a
+        toll-free number. Both now come from one function.
+        """
+        import email as email_mod
+        import email.policy
+
+        cases = [
+            sw.Fingerprint(domain="a.sbs", markers=["anydesk"],
+                           phones=["+18335550142"], content_score=9,
+                           fetched=True, http_status=200),
+            sw.Fingerprint(domain="b.sbs", markers=["windows defender"],
+                           phones=["+18774572313"],
+                           impersonates="security center",
+                           content_score=12, fetched=True, http_status=200),
+            sw.Fingerprint(domain="c.sbs", markers=["virus detected"],
+                           content_score=4, fetched=True, http_status=200),
+        ]
+        for fp in cases:
+            with self.subTest(domain=fp.domain):
+                mechanism = sw.describe_mechanism(fp)
+                md = sw.build_markdown(fp.domain, fp, sw.Attribution(),
+                                       "src", "ts")
+                raw = sw.build_eml(fp.domain, fp, sw.Attribution(
+                    registrar_abuse="a@b.test"), sw.DEFAULT_CONFIG, "r.md")
+                body = email_mod.message_from_bytes(
+                    raw, policy=email_mod.policy.default).get_content()
+                self.assertIn(mechanism.split(".")[0][:40], md)
+                self.assertIn(mechanism.split(".")[0][:40], body)
+
+    def test_no_remote_tool_claim_without_a_remote_tool_marker(self):
+        fp = sw.Fingerprint(domain="b.sbs", markers=["windows defender"],
+                            phones=["+18774572313"], content_score=12,
+                            fetched=True, http_status=200)
+        md = sw.build_markdown("b.sbs", fp, sw.Attribution(), "src", "ts")
+        self.assertNotIn("AnyDesk / TeamViewer", md)
+
     def test_csv_round_trips_commas_in_fields(self):
         import csv as csv_mod
         with tempfile.TemporaryDirectory() as tmp:
