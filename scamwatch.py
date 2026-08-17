@@ -38,7 +38,8 @@ import time
 from dataclasses import dataclass, field
 from email.message import EmailMessage
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import (Dict, Iterable, Iterator, List, Optional, Sequence, Set,
+                    Tuple)
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -540,6 +541,11 @@ class Store:
                 domains    TEXT NOT NULL DEFAULT '',
                 hits       INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS feed_hosts (
+                host TEXT PRIMARY KEY,
+                feed TEXT NOT NULL DEFAULT '',
+                seen TEXT NOT NULL DEFAULT ''
+            );
             CREATE TABLE IF NOT EXISTS meta (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL DEFAULT ''
@@ -552,6 +558,35 @@ class Store:
     @staticmethod
     def _now() -> str:
         return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+    def record_feed_hosts(self, hosts: Iterable[str], feed: str) -> None:
+        """
+        Remember every host a feed listed, not just the ones we shortlisted.
+
+        Corroboration should not depend on how a domain happened to be
+        discovered: a name found in CT that also appears on a phishing feed
+        carries the same outside opinion as one the feed handed us directly.
+        """
+        now = self._now()
+        self.con.executemany(
+            "INSERT INTO feed_hosts VALUES (?,?,?) "
+            "ON CONFLICT(host) DO UPDATE SET feed=excluded.feed, seen=excluded.seen",
+            [(h, feed, now) for h in hosts])
+        self.con.commit()
+
+    def in_feeds(self, domain: str) -> str:
+        """Return the feed that listed this host (or its parent), else ''."""
+        row = self.con.execute(
+            "SELECT feed FROM feed_hosts WHERE host=?", (domain,)).fetchone()
+        if row:
+            return row["feed"]
+        parent = registrable_domain(domain)
+        if parent != domain:
+            row = self.con.execute(
+                "SELECT feed FROM feed_hosts WHERE host=?", (parent,)).fetchone()
+            if row:
+                return row["feed"]
+        return ""
 
     def get_meta(self, key: str, default: str = "") -> str:
         row = self.con.execute(
@@ -952,9 +987,13 @@ def feed_candidates(sess: requests.Session, cfg: Dict, health: SourceHealth,
             continue
 
         matched = 0
+        all_hosts: List[str] = []
         for line in text.splitlines():
             host = host_from_feed_line(line)
-            if not host or host in emitted:
+            if not host:
+                continue
+            all_hosts.append(host)
+            if host in emitted:
                 continue
             if not any(m in host for m in matchers):
                 continue
@@ -962,7 +1001,10 @@ def feed_candidates(sess: requests.Session, cfg: Dict, health: SourceHealth,
             matched += 1
             health.yielded += 1
             yield host, "feed:" + label
-        log.debug("feed %s -> %d matching hosts", label, matched)
+        if all_hosts:
+            store.record_feed_hosts(all_hosts, label)
+        log.debug("feed %s -> %d hosts, %d matching the keyword set",
+                  label, len(all_hosts), matched)
         time.sleep(1)
 
 
@@ -1916,9 +1958,14 @@ def run_once(args, cfg: Dict, store: Store, api: requests.Session,
                 fp = archived
                 revived += 1
 
-        # A phishing feed listing someone else's judgement is corroboration.
+        # A phishing feed listing someone else's judgement is corroboration,
+        # whichever source actually surfaced the domain.
         if source.startswith("feed:"):
             fp.corroboration.append(source)
+        else:
+            listed = store.in_feeds(domain)
+            if listed:
+                fp.corroboration.append("feed:" + listed)
         if cand.urlscan_uuid and api_key:
             fp.corroboration.extend(
                 urlscan_verdict(api, cand.urlscan_uuid, api_key))

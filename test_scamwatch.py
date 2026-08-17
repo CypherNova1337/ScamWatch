@@ -809,6 +809,40 @@ class TestCandidateMerging(unittest.TestCase):
         self.assertEqual(c.urlscan_uuid, "uuid-2")
 
 
+class TestFeedMembershipCorroboration(unittest.TestCase):
+    """
+    Corroboration must not depend on which source happened to surface a
+    domain. A name found in CT that also sits on a phishing feed carries the
+    same outside opinion as one the feed handed over directly.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = sw.Store(Path(self.tmp.name) / "t.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_records_and_finds_listed_hosts(self):
+        self.store.record_feed_hosts(["evil.sbs", "bad.click"], "openphish")
+        self.assertEqual(self.store.in_feeds("evil.sbs"), "openphish")
+        self.assertEqual(self.store.in_feeds("unknown.test"), "")
+
+    def test_subdomain_matches_a_listed_parent(self):
+        self.store.record_feed_hosts(["evil.sbs"], "openphish")
+        self.assertEqual(self.store.in_feeds("login.evil.sbs"), "openphish")
+
+    def test_reinsert_is_idempotent(self):
+        self.store.record_feed_hosts(["evil.sbs"], "openphish")
+        self.store.record_feed_hosts(["evil.sbs"], "phishing_database")
+        self.assertEqual(self.store.in_feeds("evil.sbs"), "phishing_database")
+
+    def test_empty_batch_is_safe(self):
+        self.store.record_feed_hosts([], "openphish")
+        self.assertEqual(self.store.in_feeds("evil.sbs"), "")
+
+
 class TestStoreMeta(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
