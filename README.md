@@ -181,6 +181,13 @@ Keys worth knowing:
 - `urlscan_use_archive` — score urlscan's saved DOM when the live page is
   gone (default `true`, needs `URLSCAN_API_KEY`)
 - `feed_urls` — `[label, url]` pairs of keyless phishing feeds
+- `feed_backlog_per_pass` — how many previously-listed but never-examined
+  hosts to pull back in each pass (default 100). **Keep this at or below what
+  `--max-seconds` can actually process.** Measured: a 120s budget processes
+  ~80-100 candidates per pass, so a quota of 100 balances. Set it much higher
+  and you simply move the queue out of the feed and into the database. The
+  feeds hold ~280,000 hosts, so this is a standing work queue serviced at a
+  steady rate, not a backlog that empties
 - `feed_min_interval` — seconds between feed re-downloads (default 3600). The
   feeds are multi-megabyte files served for free; they are also revalidated
   with `ETag`/`If-Modified-Since`, so a `--loop` at 300s does not re-pull them
