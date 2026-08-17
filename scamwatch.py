@@ -169,6 +169,13 @@ DEFAULT_CONFIG: Dict = {
     # Minimum seconds between re-downloads of a feed; they are large files
     # served for free and change slowly.
     "feed_min_interval": 3600,
+    # How many previously-listed but never-examined hosts to pull back in per
+    # pass. Deliberately NOT tied to --limit, which caps results per source
+    # query and has nothing to do with draining a backlog: sizing this at
+    # --limit (8) left 756 stranded candidates needing ~95 passes to clear.
+    # Collect generously; --max-seconds decides how many are actually
+    # processed, and anything unreached returns next pass.
+    "feed_backlog_per_pass": 100,
     "suspicious_tlds": [
         "sbs", "click", "cfd", "cyou", "xyz", "tk", "ga", "gq", "cf", "ml",
         "top", "club", "space", "online", "site", "icu", "mom", "lol", "rest",
@@ -1985,15 +1992,18 @@ def collect_candidates(args, cfg: Dict, store: Store, api: requests.Session,
 
     # Pick up anything a previous pass listed but never got to. Without this
     # an interrupted pass strands its backlog until the feed body changes.
-    if not args.no_feeds and len(candidates) < args.limit:
-        backlog = store.unseen_feed_hosts(build_feed_matchers(cfg),
-                                          args.limit - len(candidates))
+    quota = int(cfg.get("feed_backlog_per_pass", 100))
+    if not args.no_feeds and quota > 0:
+        backlog = store.unseen_feed_hosts(build_feed_matchers(cfg), quota)
+        added = 0
         for host, feed in backlog:
+            before = len(candidates)
             consider(host, "feed:" + feed)
-        if backlog:
-            feed_health.yielded += len(backlog)
+            added += len(candidates) - before
+        if added:
+            feed_health.yielded += added
             log.info("picked up %d unexamined hosts from earlier feed listings",
-                     len(backlog))
+                     added)
 
     if skipped_allow:
         log.info("skipped %d allowlisted domains", skipped_allow)

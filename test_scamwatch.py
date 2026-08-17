@@ -1029,6 +1029,20 @@ class TestSoakRegressions(unittest.TestCase):
         self.assertNotIn("live-support-a.sbs", hosts)   # already examined
         self.assertNotIn("unrelated.example", hosts)    # not a match
 
+    def test_backlog_quota_is_independent_of_result_limit(self):
+        """
+        Sizing the backlog at --limit (max results per source query) left 756
+        stranded candidates needing ~95 passes to drain. The two quantities
+        are unrelated.
+        """
+        self.assertGreaterEqual(
+            int(sw.DEFAULT_CONFIG["feed_backlog_per_pass"]), 50)
+        self.store.record_feed_hosts(
+            [f"anydesk-{i}.sbs" for i in range(200)], "openphish")
+        got = self.store.unseen_feed_hosts(
+            {"anydesk"}, int(sw.DEFAULT_CONFIG["feed_backlog_per_pass"]))
+        self.assertEqual(len(got), 100)
+
     def test_unseen_feed_hosts_respects_limit(self):
         self.store.record_feed_hosts(
             [f"anydesk-{i}.sbs" for i in range(50)], "openphish")
