@@ -85,6 +85,7 @@ more corpses than evidence, and it warns you when it does.
 | `--force` | reprocess domains already in the database |
 | `--limit N` | max results per source query (default 50) |
 | `--delay N` | seconds between candidate fetches (default 0.5) |
+| `--max-seconds N` | wall-clock budget for candidate processing; the rest return next pass |
 | `--out` / `--db` / `--config` | relocate outputs and state |
 
 ## What comes out
@@ -161,6 +162,13 @@ Keys worth knowing:
   cheap; highest-yield first, since the circuit breaker may cut a pass short
 - `ct_keywords`, `brand_shortcodes` — local refinement, matched against
   hostnames a broad query already returned. Never sent to crt.sh directly
+- `ct_terms_per_pass` — how many CT terms to query per pass (default 4).
+  Rotates, so all terms are covered every few passes while any single pass
+  stays bounded
+- `ct_time_budget` — hard ceiling in seconds on the CT phase (default 180)
+- `ct_failure_rate` / `ct_failure_min_queries` — give up on crt.sh when this
+  fraction of queries is failing. Consecutive-failure detection alone missed
+  the interleaved mode, which is the expensive one
 - `ct_require_refine` — default `true`: a hostname must match one of the
   refinement keywords to become a candidate. Broad terms bring noise with them
   (`%defender%` returns Land Rover dealerships), and this is what keeps the
@@ -289,7 +297,16 @@ urlscan link in the report. The `.eml` is a draft, not a verdict.
 
 ## Limitations, stated honestly
 
-- **crt.sh is unreliable, and its failures are silent.** Measured directly:
+- **crt.sh is unreliable, and a *working* crt.sh is what costs time.** Measured
+  over 15 consecutive passes and a latency probe: a query that **fails**
+  returns in **0.15s**, while a query that **succeeds** takes **~34s**. So the
+  slow passes are the healthy ones. Every fast pass in the soak (221s, 234s,
+  252s) was one where crt.sh was down and the breaker cut it short; every pass
+  where crt.sh worked ran 400-600s. Shortening the read timeout would
+  therefore cut *successful* queries and silently lose coverage — the fix is
+  to ask for less per pass, so `ct_terms_per_pass` rotates a few terms at a
+  time and completes the list every few passes.
+- **crt.sh failure detail.** Measured directly:
   `%defender%` returned 2233 rows while `%windows-defender%` returned an empty
   array on one attempt and a 502 minutes later. An empty array is *not*
   evidence of absence — it is often the server giving up on an expensive

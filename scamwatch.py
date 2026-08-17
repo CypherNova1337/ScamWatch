@@ -63,6 +63,10 @@ BUSINESS_VETO = 3
 STRONG_MARKER_MIN_WEIGHT = 3
 # Politeness delay between queries to a shared public service.
 CT_QUERY_DELAY = 1.0
+# Pause after a failed query. Measured, a crt.sh 502 returns in 0.15s, so this
+# pause - not the request - is the real cost of a failing query. Kept small,
+# and patchable so tests do not pay for it.
+CT_FAILURE_SLEEP = 1.0
 
 
 # --------------------------------------------------------------------------
@@ -84,6 +88,19 @@ DEFAULT_CONFIG: Dict = {
     # before it becomes a candidate. Set false to keep everything a broad term
     # returns (much noisier).
     "ct_require_refine": True,
+    # Measured over 15 passes: a crt.sh query that FAILS costs 0.15s, but one
+    # that SUCCEEDS costs ~34s. Querying all 14 terms therefore blows any
+    # sane pass budget precisely when the source is working. Rotate a few
+    # terms per pass instead - full coverage every ceil(14/n) passes, with
+    # each pass bounded.
+    "ct_terms_per_pass": 4,
+    # Hard wall-clock ceiling on the CT phase regardless of rotation.
+    "ct_time_budget": 180,
+    # Trip the breaker when this fraction of queries has failed (with at
+    # least ct_failure_min_queries attempted). Consecutive-failure detection
+    # alone missed the common interleaved-failure mode entirely.
+    "ct_failure_rate": 0.8,
+    "ct_failure_min_queries": 5,
     # Local refinement only - these are matched against hostnames already
     # returned by a broad query, never sent to crt.sh directly.
     "ct_keywords": [
@@ -605,6 +622,28 @@ class Store:
             [(h, feed, now) for h in hosts])
         self.con.commit()
 
+    def unseen_feed_hosts(self, matchers: Set[str], limit: int) -> List[Tuple[str, str]]:
+        """
+        Hosts a feed listed that we have never examined.
+
+        An interrupted pass used to strand its backlog: feed_candidates only
+        yields from a freshly downloaded body, and once the feed starts
+        answering 304 the unprocessed remainder is never offered again. The
+        listings are already persisted, so read them from here instead of
+        depending on a download.
+        """
+        out: List[Tuple[str, str]] = []
+        cur = self.con.execute(
+            "SELECT f.host, f.feed FROM feed_hosts f "
+            "LEFT JOIN domains d ON d.domain = f.host WHERE d.domain IS NULL")
+        for row in cur:
+            host = row["host"]
+            if any(m in host for m in matchers):
+                out.append((host, row["feed"]))
+                if len(out) >= limit:
+                    break
+        return out
+
     def in_feeds(self, domain: str) -> str:
         """Return the feed that listed this host (or its parent), else ''."""
         row = self.con.execute(
@@ -759,6 +798,17 @@ class SourceHealth:
     def ok(self) -> bool:
         return not self.skipped and self.queries > 0 and self.failures < self.queries
 
+    @property
+    def degraded(self) -> bool:
+        """
+        Most queries failing. Distinguished from `ok` because a source can be
+        70% broken and still satisfy `failures < queries` - which made the
+        health line print "ok(8, 9/14 queries failed)" and defeated the point
+        of having a health line at all.
+        """
+        return (not self.skipped and self.queries > 0
+                and self.failures / self.queries >= 0.5)
+
     def summary(self) -> str:
         if self.skipped:
             return f"{self.name}=skipped"
@@ -767,7 +817,8 @@ class SourceHealth:
                     else f"{self.name}=NO-QUERIES")
         if self.failures >= self.queries:
             return f"{self.name}=FAILED({self.failures}/{self.queries})"
-        state = "ok" if self.yielded else "ok-but-empty"
+        state = "DEGRADED" if self.degraded else ("ok" if self.yielded
+                                                  else "ok-but-empty")
         detail = f"{self.name}={state}({self.yielded}"
         if self.cached:
             detail += f", {self.cached} cached"
@@ -779,7 +830,9 @@ class SourceHealth:
 def ct_candidates(sess: requests.Session, query_terms: Sequence[str],
                   refine_keywords: Sequence[str], limit: int,
                   health: SourceHealth, require_refine: bool = True,
-                  timeout: int = 60) -> Iterator[Tuple[str, str]]:
+                  timeout: int = 60, time_budget: float = 180.0,
+                  failure_rate: float = 0.8, failure_min_queries: int = 5,
+                  ) -> Iterator[Tuple[str, str]]:
     """
     Yield (domain, source_label) for freshly issued certs matching keywords.
 
@@ -791,14 +844,30 @@ def ct_candidates(sess: requests.Session, query_terms: Sequence[str],
     emitted: Set[str] = set()
     consecutive_failures = 0
     empty_keywords: List[str] = []
+    started = time.monotonic()
     for index, keyword in enumerate(query_terms):
-        # crt.sh outages are all-or-nothing. Once it is clearly down, stop
-        # hammering it: grinding through the whole keyword list at several
-        # seconds per failure would push a pass past its own loop interval.
-        if consecutive_failures >= CT_FAILURE_LIMIT:
-            health.note = f"gave up after {consecutive_failures} consecutive failures"
-            log.warning("crt.sh appears to be down - skipping remaining %d keywords",
-                        len(query_terms) - index)
+        elapsed = time.monotonic() - started
+        # A successful crt.sh query costs ~34s, so a working source is what
+        # blows the budget, not a broken one. Stop on the clock rather than
+        # trying to predict how many terms will fit.
+        if time_budget > 0 and elapsed >= time_budget:
+            health.note = f"time budget {time_budget:.0f}s reached"
+            log.info("crt.sh phase hit its %.0fs budget - %d terms not queried "
+                     "this pass (they rotate in next pass)",
+                     time_budget, len(query_terms) - index)
+            break
+        # Two failure modes, measured: a total outage returns 502s back to
+        # back, while the ordinary mode interleaves failures with successes.
+        # Consecutive detection only catches the first, and the first is the
+        # cheap one - 502s come back in 0.15s.
+        rate_tripped = (health.queries >= failure_min_queries
+                        and health.failures / max(health.queries, 1) >= failure_rate)
+        if consecutive_failures >= CT_FAILURE_LIMIT or rate_tripped:
+            reason = ("consecutive failures" if consecutive_failures >= CT_FAILURE_LIMIT
+                      else f"{health.failures}/{health.queries} queries failing")
+            health.note = f"gave up: {reason}"
+            log.warning("crt.sh unhealthy (%s) - skipping remaining %d terms",
+                        reason, len(query_terms) - index)
             break
         health.queries += 1
         try:
@@ -814,7 +883,7 @@ def ct_candidates(sess: requests.Session, query_terms: Sequence[str],
             health.failures += 1
             consecutive_failures += 1
             log.warning("crt.sh query failed for %r: %s", keyword, exc)
-            time.sleep(3)
+            time.sleep(CT_FAILURE_SLEEP)
             continue
         if not isinstance(rows, list):
             health.failures += 1
@@ -1882,11 +1951,24 @@ def collect_candidates(args, cfg: Dict, store: Store, api: requests.Session,
         candidates[domain] = Candidate(source=source, urlscan_uuid=uuid)
 
     if not args.no_ct:
-        query_terms = list(cfg.get("ct_query_terms") or cfg["ct_keywords"])
+        all_terms = list(cfg.get("ct_query_terms") or cfg["ct_keywords"])
+        per_pass = max(1, int(cfg.get("ct_terms_per_pass", 4)))
+        # Rotate through the term list so each pass is bounded while coverage
+        # still completes every ceil(len/per_pass) passes.
+        offset = int(store.get_meta("ct:rotation_offset", "0") or 0) % max(len(all_terms), 1)
+        rotated = [all_terms[(offset + i) % len(all_terms)]
+                   for i in range(min(per_pass, len(all_terms)))]
+        store.set_meta("ct:rotation_offset", str((offset + per_pass) % max(len(all_terms), 1)))
+        log.debug("crt.sh terms this pass (offset %d): %s", offset, rotated)
+        ct_health.note = f"terms {offset}-{offset + len(rotated) - 1} of {len(all_terms)}"
+
         refine = list(cfg["ct_keywords"]) + list(cfg["brand_shortcodes"])
         for domain, source in ct_candidates(
-                api, query_terms, refine, args.limit, ct_health,
-                require_refine=bool(cfg.get("ct_require_refine", True))):
+                api, rotated, refine, args.limit, ct_health,
+                require_refine=bool(cfg.get("ct_require_refine", True)),
+                time_budget=float(cfg.get("ct_time_budget", 180)),
+                failure_rate=float(cfg.get("ct_failure_rate", 0.8)),
+                failure_min_queries=int(cfg.get("ct_failure_min_queries", 5))):
             consider(domain, source)
 
     if not args.no_urlscan:
@@ -1900,6 +1982,18 @@ def collect_candidates(args, cfg: Dict, store: Store, api: requests.Session,
     if not args.no_feeds:
         for domain, source in feed_candidates(api, cfg, feed_health, store):
             consider(domain, source)
+
+    # Pick up anything a previous pass listed but never got to. Without this
+    # an interrupted pass strands its backlog until the feed body changes.
+    if not args.no_feeds and len(candidates) < args.limit:
+        backlog = store.unseen_feed_hosts(build_feed_matchers(cfg),
+                                          args.limit - len(candidates))
+        for host, feed in backlog:
+            consider(host, "feed:" + feed)
+        if backlog:
+            feed_health.yielded += len(backlog)
+            log.info("picked up %d unexamined hosts from earlier feed listings",
+                     len(backlog))
 
     if skipped_allow:
         log.info("skipped %d allowlisted domains", skipped_allow)
@@ -1998,7 +2092,20 @@ def run_once(args, cfg: Dict, store: Store, api: requests.Session,
     review = 0
 
     confirmed = 0
+    started = time.monotonic()
+    budget = float(getattr(args, "max_seconds", 0) or 0)
+    deferred = 0
+    processed = 0
     for domain, cand in sorted(candidates.items()):
+        # Bound the pass so a cold start cannot overrun its own schedule.
+        # Domains not reached are never marked seen, so they simply return
+        # next pass rather than being lost.
+        if budget > 0 and time.monotonic() - started >= budget:
+            deferred = len(candidates) - processed
+            log.info("pass budget %.0fs reached after %d candidates - deferring "
+                     "%d to the next pass", budget, processed, deferred)
+            break
+        processed += 1
         source = cand.source
         if args.no_fingerprint:
             store.upsert(domain, source, "candidate",
@@ -2130,6 +2237,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="max results per source query (default 50)")
     parser.add_argument("--delay", type=float, default=0.5,
                         help="seconds between candidate fetches (default 0.5)")
+    parser.add_argument("--max-seconds", type=float, default=0,
+                        help="wall-clock budget for processing candidates; "
+                             "unreached candidates return next pass (0 = no limit)")
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser
 
@@ -2177,9 +2287,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         if args.loop:
             while True:
+                cycle_started = time.monotonic()
                 one_pass()
-                log.info("sleeping %ds", args.interval)
-                time.sleep(args.interval)
+                elapsed = time.monotonic() - cycle_started
+                # Schedule from the start of the pass, not its end, so
+                # --interval means the cycle time it claims to. A pass that
+                # overruns its own interval is reported rather than silently
+                # turning the loop into a busy loop.
+                remaining = args.interval - elapsed
+                if remaining > 0:
+                    log.info("pass took %.0fs; sleeping %.0fs", elapsed, remaining)
+                    time.sleep(remaining)
+                else:
+                    log.warning("pass took %.0fs, longer than the %ds interval - "
+                                "running continuously; raise --interval or lower "
+                                "ct_terms_per_pass/--max-seconds",
+                                elapsed, args.interval)
         else:
             one_pass()
     except KeyboardInterrupt:

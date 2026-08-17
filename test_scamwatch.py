@@ -13,6 +13,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import requests
+
 import scamwatch as sw
 
 
@@ -928,6 +930,109 @@ class TestFeedMembershipCorroboration(unittest.TestCase):
     def test_empty_batch_is_safe(self):
         self.store.record_feed_hosts([], "openphish")
         self.assertEqual(self.store.in_feeds("evil.sbs"), "")
+
+
+class TestSoakRegressions(unittest.TestCase):
+    """
+    Five defects found by 15 consecutive live passes, none of which the rest
+    of this suite detected. Three were in code previously reported as working.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = sw.Store(Path(self.tmp.name) / "t.db")
+        self._delay = sw.CT_QUERY_DELAY
+        self._fsleep = sw.CT_FAILURE_SLEEP
+        sw.CT_QUERY_DELAY = 0
+        sw.CT_FAILURE_SLEEP = 0
+
+    def tearDown(self):
+        sw.CT_QUERY_DELAY = self._delay
+        sw.CT_FAILURE_SLEEP = self._fsleep
+        self.store.close()
+        self.tmp.cleanup()
+
+    class SlowSession:
+        """crt.sh as measured: failures cost 0.15s, successes cost ~34s."""
+
+        def __init__(self, fail_every=2):
+            self.calls = 0
+            self.fail_every = fail_every
+
+        def get(self, url, params=None, timeout=None, **kw):
+            self.calls += 1
+            outer = self
+            failing = (self.calls % self.fail_every) == 0
+
+            class R:
+                status_code = 502 if failing else 200
+
+                def raise_for_status(self):
+                    if failing:
+                        raise requests.HTTPError("502")
+
+                def json(self):
+                    return [{"entry_timestamp": "2026-08-17T00:00:00",
+                             "name_value": f"windows-defender-{outer.calls}.sbs"}]
+            return R()
+
+    def test_health_reports_degraded_not_ok(self):
+        """"ok(8, 9/14 queries failed)" defeated the point of a health line."""
+        health = sw.SourceHealth("ct", queries=14, failures=9, yielded=8)
+        self.assertTrue(health.ok)              # old check still passes
+        self.assertTrue(health.degraded)
+        self.assertIn("DEGRADED", health.summary())
+
+    def test_breaker_trips_on_interleaved_failures(self):
+        """
+        The breaker only counted consecutive failures, so the interleaved
+        mode -- which is the expensive one -- never tripped it. Pass 7 burned
+        600s through 14 failures with the breaker asleep.
+        """
+        health = sw.SourceHealth("ct")
+        sess = self.SlowSession(fail_every=1)   # every query fails
+        list(sw.ct_candidates(sess, ["a"] * 20, [], 5, health,
+                              require_refine=False, failure_rate=0.8,
+                              failure_min_queries=5))
+        self.assertLess(health.queries, 20)     # gave up early
+        self.assertIn("gave up", health.note)
+
+    def test_ct_phase_respects_its_time_budget(self):
+        health = sw.SourceHealth("ct")
+        sess = self.SlowSession(fail_every=99)  # everything succeeds
+        list(sw.ct_candidates(sess, ["a"] * 50, [], 5, health,
+                              require_refine=False, time_budget=0.001))
+        # stops early rather than grinding all 50 terms
+        self.assertLess(health.queries, 50)
+        self.assertIn("budget", health.note)
+
+    def test_term_rotation_advances_and_wraps(self):
+        self.assertEqual(self.store.get_meta("ct:rotation_offset", "0"), "0")
+        self.store.set_meta("ct:rotation_offset", "12")
+        offset = int(self.store.get_meta("ct:rotation_offset")) % 14
+        rotated = [i % 14 for i in range(offset, offset + 4)]
+        self.assertEqual(rotated, [12, 13, 0, 1])   # wraps cleanly
+
+    def test_unseen_feed_hosts_recovers_a_stranded_backlog(self):
+        """
+        An interrupted pass stranded its backlog: feed_candidates only yields
+        from a fresh download, and a 304 meant the remainder was never
+        re-offered. The listings are persisted, so read them from there.
+        """
+        self.store.record_feed_hosts(
+            ["live-support-a.sbs", "anydesk-b.sbs", "unrelated.example"],
+            "openphish")
+        self.store.upsert("live-support-a.sbs", "feed:openphish")  # already done
+        got = self.store.unseen_feed_hosts({"live-support", "anydesk"}, 10)
+        hosts = [h for h, _ in got]
+        self.assertIn("anydesk-b.sbs", hosts)
+        self.assertNotIn("live-support-a.sbs", hosts)   # already examined
+        self.assertNotIn("unrelated.example", hosts)    # not a match
+
+    def test_unseen_feed_hosts_respects_limit(self):
+        self.store.record_feed_hosts(
+            [f"anydesk-{i}.sbs" for i in range(50)], "openphish")
+        self.assertEqual(len(self.store.unseen_feed_hosts({"anydesk"}, 7)), 7)
 
 
 class TestStoreMeta(unittest.TestCase):
