@@ -190,23 +190,40 @@ Keys worth knowing:
 
 Scored against 98 live pages pulled from urlscan, with each gate added in turn:
 
-| Gate | Pages it would have reported | True positives |
+Two labelled sets were used: pages found by broad topic queries (which turned
+out to be legitimate) and pages found by the kit's own artifacts (which turned
+out to be real scams).
+
+| Gate | False positives | Real scams caught |
 |---|---|---|
-| Content markers only | 7 | **0** |
-| \+ editorial / business veto | 3 | **0** |
-| \+ corroboration required | **0** | — |
+| Content markers only | 7 | — |
+| \+ editorial / business veto | 0 | 3 of 5 |
+| \+ impersonation override | **0** | **5 of 5** |
 
 The seven were two blog posts about malware, a security vendor's advisory on
 AnyDesk phishing, and four genuine computer repair businesses. Every one of
 them legitimately says "your computer is infected" and "we use AnyDesk". Run
 as originally written, the tool would have mailed abuse desks about all seven.
 
-Two conclusions are baked into the current design. Vocabulary identifies a
-topic and cannot establish intent, so the content gate is necessary but never
-sufficient. And **no true positive has yet been observed**, so the detector's
-real hit rate is unknown — the sample may simply have contained none, since
-live tech-support pages are short-lived and often sit behind malvertising
-redirects that urlscan's public corpus underrepresents.
+The seven were two blog posts about malware, a security vendor's advisory on
+AnyDesk phishing, and four genuine computer repair businesses — all of which
+legitimately say "your computer is infected" and "we use AnyDesk".
+
+The confirmed scams were found a different way, and that difference is the
+main lesson: **searching for the topic finds legitimate sites, searching for
+the kit finds scams.** `filename:"beep.mp3"` — the alarm loop these pages play
+— surfaced five confirmed scam pages, among them `windows-defender-alert.com`
+("Windows Security - CRITICAL ALERT", score 29, toll-free number, corroborated
+by urlscan). Topic keywords surfaced repair shops. Both query styles are free
+tier; only one of them works.
+
+The veto initially cut too deep in the other direction, rejecting two real
+scams: one titled "Security Center" carrying a toll-free number was vetoed
+because it included "privacy policy", "about us" and "terms of service" —
+wording kits copy precisely in order to look legitimate. Hence the
+impersonation override: a page may *discuss* Windows Defender, and a business
+may sell repairs, but only a scam presents itself *as* Defender while claiming
+a detection about you or pushing a number to call.
 
 Treat `review` notes as leads and `confirmed` reports as drafts. Read the page
 before you send anything.
