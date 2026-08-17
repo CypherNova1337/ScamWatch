@@ -120,6 +120,16 @@ DEFAULT_CONFIG: Dict = {
         ["fake_alert_title",
          'page.title:"virus" OR page.title:"windows defender" OR '
          'page.title:"security alert"'],
+        # Validated against live data: the kit plays an alarm loop, and these
+        # filenames surfaced five confirmed scam pages where broader queries
+        # returned only legitimate sites.
+        ["kit_audio",
+         'filename:"beep.mp3" OR filename:"alert.mp3" OR '
+         'filename:"warning.mp3" OR filename:"siren.mp3"'],
+        # Stock scare titles used by the same kits.
+        ["kit_title",
+         'page.title:"Critical Alert" OR page.title:"Security Center" OR '
+         'page.title:"has been blocked" OR page.title:"Windows Security"'],
     ],
     # Scans older than this are ignored. These pages are usually gone within a
     # day: of 14 urlscan hits fetched during testing, 10 returned a hosting
@@ -274,6 +284,26 @@ PARKING_MARKERS: List[str] = [
     "namesilo parking", "cashparking", "domain broker",
 ]
 
+# Titles that claim to BE a security product. A page may discuss Windows
+# Defender or sell repairs; only a scam presents itself as Defender. Matched
+# against the page title, which is where the impersonation is staged.
+TITLE_IMPERSONATION: List[str] = [
+    "windows defender", "windows security", "microsoft security",
+    "microsoft support", "security center", "defender alert",
+    "critical alert", "virus alert", "system alert", "security warning",
+    "norton", "mcafee", "avast", "windows firewall",
+]
+
+# Assertions that something has been detected on the visitor's machine right
+# now. An article describes these; a business does not make them about you.
+FABRICATED_DETECTION: List[str] = [
+    "your computer is infected", "your device is infected",
+    "your pc is infected", "virus detected", "threat detected",
+    "trojan detected", "spyware detected", "firewall breach",
+    "ip address has been", "do not restart", "do not shut down",
+    "do not turn off", "do not close this window",
+]
+
 # --- Negative signals -------------------------------------------------------
 # The content markers describe a TOPIC, not an INTENT, and that is not enough
 # on its own. Measured against 98 live pages, topic-only scoring confirmed
@@ -409,6 +439,7 @@ def compile_markers() -> List[Tuple[str, int, re.Pattern]]:
 
 
 COMPILED_PARKING = [re.compile(re.escape(m)) for m in PARKING_MARKERS]
+COMPILED_IMPERSONATION = [(m, re.compile(re.escape(m))) for m in TITLE_IMPERSONATION]
 COMPILED_EDITORIAL = [(m, re.compile(re.escape(m))) for m in EDITORIAL_MARKERS]
 COMPILED_BUSINESS = [(m, re.compile(re.escape(m))) for m in BUSINESS_MARKERS]
 COMPILED_MARKERS = compile_markers()
@@ -1034,6 +1065,7 @@ class Fingerprint:
     http_status: int = 0
     fetched: bool = False
     parked: bool = False
+    impersonates: str = ""
     editorial: List[str] = field(default_factory=list)
     business: List[str] = field(default_factory=list)
     # Independent signals that someone other than this tool considers the
@@ -1059,6 +1091,24 @@ class Fingerprint:
     @property
     def corroborated(self) -> bool:
         return bool(self.corroboration)
+
+    @property
+    def fabricated_detection(self) -> List[str]:
+        return [m for m in self.markers if m in FABRICATED_DETECTION]
+
+    @property
+    def impersonation_attack(self) -> bool:
+        """
+        Presents itself as a security product AND either claims a detection
+        about the visitor or pushes a number to call.
+
+        No article and no repair shop does both: an article discusses the
+        product, a business trades under its own name. This combination is
+        the scam pattern itself, so it overrides the editorial/business veto
+        that would otherwise reject it.
+        """
+        return bool(self.impersonates) and bool(self.fabricated_detection
+                                                or self.phones)
 
     @property
     def looks_editorial(self) -> bool:
@@ -1290,6 +1340,13 @@ def score_html(fp: Fingerprint, html: str) -> None:
     fp.phones = extract_phones(html)
     if fp.phones:
         fp.content_score += 2
+
+    title = fp.title.lower()
+    for text, pattern in COMPILED_IMPERSONATION:
+        if pattern.search(title):
+            fp.impersonates = text
+            fp.content_score += 3
+            break
 
 
 def fingerprint(sess: requests.Session, domain: str, cfg: Dict,
@@ -1859,6 +1916,14 @@ def passes_content_gate(fp: Fingerprint, cfg: Dict) -> bool:
     # nothing to act on.
     if fp.parked:
         return False
+
+    # A page posing as a security product while claiming a detection about
+    # the visitor, or pushing a number to call, is the scam pattern itself.
+    # It outranks the veto below: two real scams titled "Security Center"
+    # were rejected as "businesses" over three generic words like
+    # "privacy policy", which kits copy precisely to look legitimate.
+    if fp.impersonation_attack:
+        return True
 
     # Vocabulary alone cannot tell a scam from an article about scams or from
     # a repair shop's advertising - measured, that mistake was 7 for 7. A page

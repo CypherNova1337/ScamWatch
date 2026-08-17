@@ -702,6 +702,93 @@ class TestUrlscanVerdict(unittest.TestCase):
         self.assertEqual(sw.urlscan_verdict(sess, "u", "key"), [])
 
 
+class TestImpersonationOverride(unittest.TestCase):
+    """
+    Regression, both directions, from live pages.
+
+    The editorial/business veto fixed 7 false positives but created false
+    negatives: 73y.8ca.mytemp.website, a real scam titled "Security Center"
+    scoring 17 with a toll-free number, was rejected because three generic
+    words like "privacy policy" tripped the business veto - wording kits copy
+    precisely in order to look legitimate.
+    """
+
+    def _page(self, domain, title, body):
+        fp = sw.Fingerprint(domain=domain, fetched=True, http_status=200)
+        sw.score_html(fp, f"<html><head><title>{title}</title></head>"
+                          f"<body>{body}</body></html>")
+        return fp
+
+    def test_real_scam_survives_the_business_veto(self):
+        fp = self._page(
+            "73y.8ca.mytemp.website", "Security Center",
+            "<p>Windows Defender: threat detected. Microsoft support. "
+            "Call 1-888-453-6259.</p><a>Privacy Policy</a><a>About Us</a>"
+            "<a>Terms of Service</a>")
+        self.assertTrue(fp.looks_like_a_business)     # veto would have fired
+        self.assertEqual(fp.impersonates, "security center")
+        self.assertTrue(fp.impersonation_attack)
+        self.assertTrue(sw.passes_content_gate(fp, sw.DEFAULT_CONFIG))
+        # corroboration is still required before anything is addressed
+        self.assertFalse(sw.should_confirm(fp, sw.DEFAULT_CONFIG))
+        fp.corroboration.append("urlscan:malicious")
+        self.assertTrue(sw.should_confirm(fp, sw.DEFAULT_CONFIG))
+
+    def test_impersonation_with_only_a_phone_is_enough(self):
+        """The second miss had no fabricated-detection wording, just a number."""
+        fp = self._page("pub-x.r2.dev", "Security center",
+                        "<p>Windows Defender. Norton. McAfee. "
+                        "Toll-free 1-877-457-2313.</p>")
+        self.assertEqual(fp.fabricated_detection, [])
+        self.assertTrue(fp.phones)
+        self.assertTrue(sw.passes_content_gate(fp, sw.DEFAULT_CONFIG))
+        fp.corroboration.append("urlscan:malicious")
+        self.assertTrue(sw.should_confirm(fp, sw.DEFAULT_CONFIG))
+
+    def test_repair_shop_trades_under_its_own_name_and_is_still_rejected(self):
+        fp = self._page(
+            "pcwatchdogs.com", "PCWatchdogs - Local Computer Repair",
+            "<p>Is your computer infected? We remove viruses. Call "
+            "+1 405 655 8324.</p><a>About Us</a><a>Opening hours</a>"
+            "<a>Privacy Policy</a><a>Our services</a>")
+        self.assertEqual(fp.impersonates, "")
+        self.assertFalse(fp.impersonation_attack)
+        # rejected by the gate itself, so corroboration cannot rescue it
+        self.assertFalse(sw.passes_content_gate(fp, sw.DEFAULT_CONFIG))
+        fp.corroboration.append("urlscan:malicious")
+        self.assertFalse(sw.should_confirm(fp, sw.DEFAULT_CONFIG))
+
+    def test_article_about_the_product_is_still_rejected(self):
+        fp = self._page(
+            "searchandhelp.com", "How to Get TeamViewer Support: A Guide",
+            "<p>Your computer is infected? This comprehensive guide explains "
+            "remote control and TeamViewer. Posted on. Leave a reply. "
+            "Related posts.</p>")
+        self.assertFalse(fp.impersonation_attack)
+        self.assertFalse(sw.passes_content_gate(fp, sw.DEFAULT_CONFIG))
+
+    def test_vendor_advisory_is_still_rejected(self):
+        fp = self._page(
+            "www.seqrite.com", "Invoice Phishing Campaign Leveraging AnyDesk",
+            "<p>AnyDesk abuse. Threat research. Indicators of compromise. "
+            "Malware analysis. Published on.</p>")
+        self.assertFalse(sw.should_confirm(fp, sw.DEFAULT_CONFIG))
+
+    def test_impersonating_title_alone_does_not_confirm(self):
+        """Without a detection claim or a number there is no attack yet."""
+        fp = self._page("x.sbs", "Windows Defender",
+                        "<p>windows defender information page</p>")
+        self.assertTrue(fp.impersonates)
+        self.assertFalse(fp.impersonation_attack)
+
+    def test_parked_page_is_never_rescued_by_impersonation(self):
+        fp = self._page("x.sbs", "Windows Security Center",
+                        "<p>Virus detected. Call 1-833-555-0142. "
+                        "This domain is for sale.</p>")
+        self.assertTrue(fp.parked)
+        self.assertFalse(sw.passes_content_gate(fp, sw.DEFAULT_CONFIG))
+
+
 class TestUrlscanDateFilter(unittest.TestCase):
     """
     urlscan's index reaches back years; these pages live for hours. Of 14
