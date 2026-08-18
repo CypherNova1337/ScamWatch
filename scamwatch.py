@@ -2063,9 +2063,18 @@ def passes_content_gate(fp: Fingerprint, cfg: Dict) -> bool:
     if fp.parked:
         return False
 
+    # An article about scams is not a scam, and impersonation wording does not
+    # change that. Measured across the labelled set: all five confirmed scam
+    # pages carry ZERO editorial markers, while a blog post quoting scam text
+    # carries five. Kits copy the furniture of a business - "privacy policy",
+    # "about us" - but not bylines, comment forms and related-posts blocks.
+    # So editorial outranks impersonation, and business does not.
+    if fp.looks_editorial:
+        return False
+
     # A page posing as a security product while claiming a detection about
     # the visitor, or pushing a number to call, is the scam pattern itself.
-    # It outranks the veto below: two real scams titled "Security Center"
+    # It outranks the business veto: two real scams titled "Security Center"
     # were rejected as "businesses" over three generic words like
     # "privacy policy", which kits copy precisely to look legitimate.
     if fp.impersonation_attack:

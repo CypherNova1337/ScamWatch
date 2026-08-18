@@ -847,6 +847,60 @@ class TestOwnBrandNotImpersonation(unittest.TestCase):
         self.assertFalse(fp.is_own_brand)
 
 
+class TestEditorialOutranksImpersonation(unittest.TestCase):
+    """
+    Found by the pre-merge recall probe: prashantkumar96.wordpress.com, a
+    personal blog post about malware, scored 17 and passed the content gate.
+    Its title names "Microsoft Security Essentials" and it quotes scam wording,
+    so the impersonation rule fired and overrode the editorial veto.
+
+    Measured across the labelled set, the asymmetry is earned: all five
+    confirmed scam pages carry ZERO editorial markers, while the blog carries
+    five. Kits copy the furniture of a business - "privacy policy", "about
+    us" - but not bylines, comment forms or related-posts blocks.
+    """
+
+    def _page(self, domain, title, body):
+        fp = sw.Fingerprint(domain=domain, fetched=True, http_status=200)
+        sw.score_html(fp, f"<html><head><title>{title}</title></head>"
+                          f"<body>{body}</body></html>")
+        return fp
+
+    def test_blog_about_scams_is_rejected_despite_impersonating_title(self):
+        fp = self._page(
+            "prashantkumar96.wordpress.com",
+            "Prashant's Blog | Microsoft Security Essentials",
+            "<p>Virus detected. Your PC is infected. Posted on. Leave a "
+            "reply. Related posts. Read more. WordPress.</p>")
+        self.assertTrue(fp.impersonation_attack)     # rule still fires
+        self.assertTrue(fp.looks_editorial)
+        self.assertFalse(sw.passes_content_gate(fp, sw.DEFAULT_CONFIG))
+
+    def test_business_furniture_does_not_save_a_real_scam(self):
+        """Kits copy "privacy policy" and "about us"; that must not exempt."""
+        fp = self._page(
+            "73y.8ca.mytemp.website", "Security Center",
+            "<p>Windows Defender threat detected. Call 1-888-453-6259.</p>"
+            "<a>Privacy Policy</a><a>About Us</a><a>Terms of Service</a>")
+        self.assertTrue(fp.looks_like_a_business)
+        self.assertEqual(fp.editorial, [])
+        self.assertTrue(sw.passes_content_gate(fp, sw.DEFAULT_CONFIG))
+
+    def test_confirmed_scam_corpus_carries_no_editorial_markers(self):
+        for domain, title, body in (
+            ("windows-defender-alert.com", "Windows Security - CRITICAL ALERT",
+             "<p>Your computer is infected. Call 1-888-555-0199.</p>"),
+            ("marvelous-gaufre-0b79ab.netlify.app", "Windows Security Center",
+             "<p>Windows Defender. Microsoft support. Call 1-855-775-5013.</p>"),
+            ("pub-fc4e.r2.dev", "Security center",
+             "<p>Windows Defender. Norton. Toll-free 1-877-457-2313.</p>"),
+        ):
+            with self.subTest(domain=domain):
+                fp = self._page(domain, title, body)
+                self.assertEqual(fp.editorial, [])
+                self.assertTrue(sw.passes_content_gate(fp, sw.DEFAULT_CONFIG))
+
+
 class TestUrlscanDateFilter(unittest.TestCase):
     """
     urlscan's index reaches back years; these pages live for hours. Of 14
