@@ -1260,6 +1260,34 @@ class TestReportRendering(unittest.TestCase):
         md = sw.build_markdown("b.sbs", fp, sw.Attribution(), "src", "ts")
         self.assertNotIn("AnyDesk / TeamViewer", md)
 
+    def test_recipients_are_deduplicated(self):
+        """
+        Observed live: a GoDaddy-registered, GoDaddy-hosted domain produced
+        "To: abuse@godaddy.com, abuse@godaddy.com". An abuse report that
+        cannot address itself correctly undercuts its own credibility.
+        """
+        import email as email_mod
+        import email.policy
+        fp = sw.Fingerprint(domain="x.sbs", markers=["anydesk"],
+                            content_score=9, fetched=True, http_status=200)
+        att = sw.Attribution(registrar_abuse="abuse@godaddy.com",
+                             host_abuse="ABUSE@GoDaddy.com")
+        raw = sw.build_eml("x.sbs", fp, att, sw.DEFAULT_CONFIG, "r.md")
+        msg = email_mod.message_from_bytes(raw, policy=email_mod.policy.default)
+        self.assertEqual(msg["To"].lower().count("godaddy.com"), 1)
+
+    def test_distinct_recipients_are_both_kept(self):
+        import email as email_mod
+        import email.policy
+        fp = sw.Fingerprint(domain="x.sbs", markers=["anydesk"],
+                            content_score=9, fetched=True, http_status=200)
+        att = sw.Attribution(registrar_abuse="abuse@namecheap.com",
+                             host_abuse="abuse@cloudflare.com")
+        raw = sw.build_eml("x.sbs", fp, att, sw.DEFAULT_CONFIG, "r.md")
+        msg = email_mod.message_from_bytes(raw, policy=email_mod.policy.default)
+        self.assertIn("namecheap", msg["To"])
+        self.assertIn("cloudflare", msg["To"])
+
     def test_csv_round_trips_commas_in_fields(self):
         import csv as csv_mod
         with tempfile.TemporaryDirectory() as tmp:

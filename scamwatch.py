@@ -1789,7 +1789,16 @@ Automated detection: verify the evidence above before sending this anywhere.
 
 def build_eml(domain: str, fp: Fingerprint, att: Attribution,
               cfg: Dict, report_name: str) -> bytes:
-    recipients = [addr for addr in (att.registrar_abuse, att.host_abuse) if addr]
+    # Registrar and host frequently resolve to the same desk (a GoDaddy-hosted
+    # GoDaddy-registered domain addressed abuse@godaddy.com twice in testing).
+    # Dedupe case-insensitively while preserving order.
+    recipients: List[str] = []
+    _seen_addrs: Set[str] = set()
+    for addr in (att.registrar_abuse, att.host_abuse):
+        key = (addr or "").strip().lower()
+        if key and key not in _seen_addrs:
+            _seen_addrs.add(key)
+            recipients.append(addr.strip())
     msg = EmailMessage()
     msg["To"] = ", ".join(recipients) if recipients else "abuse@REPLACE-ME"
     if cfg.get("reporter_from"):
