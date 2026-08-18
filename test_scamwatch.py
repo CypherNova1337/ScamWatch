@@ -791,6 +791,62 @@ class TestImpersonationOverride(unittest.TestCase):
         self.assertFalse(sw.passes_content_gate(fp, sw.DEFAULT_CONFIG))
 
 
+class TestOwnBrandNotImpersonation(unittest.TestCase):
+    """
+    Found by the pre-merge recall probe: investor.vanguard.com -- Vanguard's
+    real Security Center page, carrying their real support numbers -- matched
+    the "security center" impersonation term and so bypassed the business
+    veto, passing the content gate. Only the corroboration requirement stopped
+    an abuse report being generated against Vanguard. Defence in depth should
+    not be load-bearing, so a brand's own page is no longer impersonation.
+    """
+
+    def _page(self, domain, title, body):
+        fp = sw.Fingerprint(domain=domain, fetched=True, http_status=200)
+        sw.score_html(fp, f"<html><head><title>{title}</title></head>"
+                          f"<body>{body}</body></html>")
+        return fp
+
+    def test_brands_own_security_page_is_not_an_attack(self):
+        fp = self._page("investor.vanguard.com", "Security Center | Vanguard",
+                        "<p>Call 1-877-223-6977. Our services. "
+                        "Terms and conditions.</p>")
+        self.assertTrue(fp.is_own_brand)
+        self.assertFalse(fp.impersonation_attack)
+        self.assertFalse(sw.passes_content_gate(fp, sw.DEFAULT_CONFIG))
+
+    def test_subdomains_count_as_the_same_brand(self):
+        fp = self._page("secure.login.vanguard.com", "Vanguard Security Center",
+                        "<p>Call 1-877-223-6977.</p>")
+        self.assertTrue(fp.is_own_brand)
+
+    def test_real_scams_are_unaffected(self):
+        for domain, title, body in (
+            ("windows-defender-alert.com", "Windows Security - CRITICAL ALERT",
+             "<p>Your computer is infected. Call 1-888-555-0199.</p>"),
+            ("73y.8ca.mytemp.website", "Security Center",
+             "<p>Windows Defender threat detected. Call 1-888-453-6259.</p>"),
+            ("marvelous-gaufre-0b79ab.netlify.app", "Windows Security Center",
+             "<p>Windows Defender. Microsoft support. Call 1-855-775-5013.</p>"),
+        ):
+            with self.subTest(domain=domain):
+                fp = self._page(domain, title, body)
+                self.assertFalse(fp.is_own_brand)
+                self.assertTrue(sw.passes_content_gate(fp, sw.DEFAULT_CONFIG))
+
+    def test_domain_named_after_the_pretence_gets_no_exemption(self):
+        """"security-center.sbs" is a scammer naming the domain for the lie."""
+        fp = self._page("security-center.sbs", "Security Center",
+                        "<p>Virus detected. Call 1-833-555-0142.</p>")
+        self.assertFalse(fp.is_own_brand)
+        self.assertTrue(sw.passes_content_gate(fp, sw.DEFAULT_CONFIG))
+
+    def test_short_labels_are_not_treated_as_brands(self):
+        fp = self._page("abc.sbs", "Security Center abc",
+                        "<p>Virus detected. Call 1-833-555-0142.</p>")
+        self.assertFalse(fp.is_own_brand)
+
+
 class TestUrlscanDateFilter(unittest.TestCase):
     """
     urlscan's index reaches back years; these pages live for hours. Of 14

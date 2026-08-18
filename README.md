@@ -262,7 +262,7 @@ would find one directly are gated behind a paid plan.
 them and sends them. That is deliberate and you should keep it that way.
 
 **A false positive is worse than a miss.** Reporting a legitimate business to
-its registrar can take a real site offline. Four guards exist:
+its registrar can take a real site offline. Five guards exist:
 
 1. **The allowlist.** Legitimate vendors, banks, and every `.gov` / `.edu` /
    `.mil` / `.police.uk`-class suffix are never reported, regardless of what a
@@ -290,14 +290,21 @@ its registrar can take a real site offline. Four guards exist:
    This is not hypothetical: during testing, a live page whose only marker was
    `error code` reached a combined score of 6 (half of it from the domain name)
    and was reported. It scores 3 against the current gate and is rejected.
-3. **At least one strong marker is required.** Reaching the threshold by
+3. **A brand's own page is not impersonation.** `investor.vanguard.com` is
+   titled "Security Center | Vanguard" and lists Vanguard's real support
+   numbers; it matched the impersonation rule and passed the content gate
+   during pre-merge testing. Only the corroboration requirement stopped a
+   report being addressed about Vanguard. When the title names the site's own
+   registrable label, the page is that brand's own. A domain named after the
+   pretence (`security-center.sbs`) gets no such exemption.
+4. **At least one strong marker is required.** Reaching the threshold by
    stacking weak signals is not enough. A live pass surfaced
    `suncoastcreditunion.com`, a real credit union — and a legitimate
    security-awareness page can carry `security alert` + `your password` +
    `call the number`, which is exactly the threshold. Confirmation now needs a
    marker that describes something only a scam page does: an AnyDesk install
    prompt, `virus detected`, `do not restart your computer`.
-4. **`--dry-run`.** Use it whenever you change scoring or keywords.
+5. **`--dry-run`.** Use it whenever you change scoring or keywords.
 
 **Verify each report before sending.** Open the page yourself, or check the
 urlscan link in the report. The `.eml` is a draft, not a verdict.

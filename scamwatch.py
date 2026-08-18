@@ -1173,6 +1173,30 @@ class Fingerprint:
         return [m for m in self.markers if m in FABRICATED_DETECTION]
 
     @property
+    def is_own_brand(self) -> bool:
+        """
+        The title names the site's own registrable label, so the page is that
+        brand's own, not a pretence at someone else's.
+
+        Found live: investor.vanguard.com, titled "Security Center | Vanguard"
+        and carrying Vanguard's real support numbers, matched the "security
+        center" impersonation term and so bypassed the business veto. Only the
+        corroboration requirement stopped an abuse report against Vanguard.
+
+        A label that is itself a security term ("security-center.sbs") gets no
+        exemption - that is a scammer naming the domain after the pretence.
+        """
+        label = registrable_domain(self.domain).split(".", 1)[0]
+        if len(label) < 4:
+            return False
+        flat = label.replace("-", "")
+        if any(flat == term.replace(" ", "") or flat == term.replace("-", "")
+               for term in TITLE_IMPERSONATION):
+            return False
+        title = self.title.lower().replace("-", "")
+        return flat in title.replace(" ", "") or label.lower() in self.title.lower()
+
+    @property
     def impersonation_attack(self) -> bool:
         """
         Presents itself as a security product AND either claims a detection
@@ -1183,6 +1207,8 @@ class Fingerprint:
         the scam pattern itself, so it overrides the editorial/business veto
         that would otherwise reject it.
         """
+        if self.is_own_brand:
+            return False
         return bool(self.impersonates) and bool(self.fabricated_detection
                                                 or self.phones)
 
