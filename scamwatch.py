@@ -34,6 +34,7 @@ import re
 import socket
 import sqlite3
 import sys
+import textwrap
 import time
 from dataclasses import dataclass, field
 from email.message import EmailMessage
@@ -478,7 +479,10 @@ def load_config(path: Path) -> Dict:
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
     if not path.exists():
         path.write_text(json.dumps(cfg, indent=2) + "\n")
-        log.info("wrote default config to %s - edit it and rerun", path)
+        # The defaults are the tested ones. Saying "edit it and rerun" while
+        # carrying on regardless reads as though the run did not count.
+        log.info("wrote a default config to %s - the defaults are fine, "
+                 "no changes needed", path)
         return cfg
     try:
         user_cfg = json.loads(path.read_text())
@@ -537,6 +541,23 @@ def is_allowlisted(domain: str, allowlist: Set[str],
 
     # a subdomain of anything allowlisted
     return any(domain.endswith("." + allowed) for allowed in allowlist)
+
+
+def dedupe_key(domain: str) -> str:
+    """
+    The key under which www.example.com and example.com are the same site.
+
+    They are one page to a victim and one report to an abuse desk, so seeing
+    both should not produce two findings. The original hostname is still what
+    gets fetched - some hosts only answer on one of the two - this only
+    decides whether the second one is a new candidate.
+    """
+    if domain.startswith("www.") and domain.count(".") > 1:
+        bare = domain[4:]
+        # "www.co.uk" is not the www of a registrable domain; leave it alone.
+        if bare not in MULTI_PART_SUFFIXES and "." in bare:
+            return bare
+    return domain
 
 
 def valid_domain(domain: str) -> bool:
@@ -724,6 +745,12 @@ class Store:
                     "UPDATE phones SET last_seen=?, domains=?, hits=hits+1 "
                     "WHERE phone=?", (now, ",".join(known), phone))
         self.con.commit()
+
+    def recent_findings(self, limit: int = 25) -> List[sqlite3.Row]:
+        """Everything worth a human's attention, newest first."""
+        return self.con.execute(
+            "SELECT * FROM domains WHERE status IN ('confirmed','review') "
+            "ORDER BY last_seen DESC, domain LIMIT ?", (int(limit),)).fetchall()
 
     def all_phones(self) -> List[sqlite3.Row]:
         return self.con.execute(
@@ -1927,7 +1954,7 @@ def write_ioc_sheet(store: Store, path: Path) -> None:
 
 
 def write_review_note(domain: str, fp: Fingerprint, source: str,
-                      outdir: Path) -> None:
+                      outdir: Path) -> str:
     """
     Record a lead that nobody else has corroborated.
 
@@ -1940,7 +1967,8 @@ def write_review_note(domain: str, fp: Fingerprint, source: str,
     timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     slug = re.sub(r"[^a-z0-9.-]", "_", domain)[:80]
     quoted = requests.utils.quote(domain)
-    (review_dir / f"{timestamp}_{slug}.md").write_text(f"""# Needs review - {domain}
+    note_path = review_dir / f"{timestamp}_{slug}.md"
+    note_path.write_text(f"""# Needs review - {domain}
 
 Content markers fired, but no independent source corroborates this. It is a
 lead, not a finding. Open the page (or the urlscan link) before acting.
@@ -1960,10 +1988,11 @@ If this is a genuine scam page, corroborate it (submit it to urlscan, check a
 phishing feed) and it will be picked up as a confirmation on a later pass.
 """, encoding="utf-8")
     log.info("review note written for %s (uncorroborated)", domain)
+    return f"review/{note_path.name}"
 
 
 def write_reports(sess: requests.Session, domain: str, fp: Fingerprint,
-                  source: str, outdir: Path, cfg: Dict) -> Attribution:
+                  source: str, outdir: Path, cfg: Dict) -> str:
     att = attribute(sess, domain, fp, cfg)
     timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     slug = re.sub(r"[^a-z0-9.-]", "_", domain)[:80]
@@ -1981,7 +2010,7 @@ def write_reports(sess: requests.Session, domain: str, fp: Fingerprint,
         " ".join(fp.phones), " ".join(fp.brands), fp.title,
     ])
     log.info("report written: %s (+ %s)", md_path.name, eml_path.name)
-    return att
+    return md_path.name
 
 
 # --------------------------------------------------------------------------
@@ -2000,19 +2029,24 @@ def collect_candidates(args, cfg: Dict, store: Store, api: requests.Session,
     feed_health = SourceHealth("feeds", skipped=args.no_feeds)
     healths = [ct_health, urlscan_health, feed_health]
 
+    chosen: Dict[str, str] = {}   # dedupe key -> hostname actually queued
+
     def consider(domain: str, source: str, uuid: str = "") -> None:
         nonlocal skipped_allow
-        if domain in candidates:
+        key = dedupe_key(domain)
+        already = chosen.get(key)
+        if already is not None:
             # keep an archive reference if a later source supplies one
-            if uuid and not candidates[domain].urlscan_uuid:
-                candidates[domain].urlscan_uuid = uuid
+            if uuid and not candidates[already].urlscan_uuid:
+                candidates[already].urlscan_uuid = uuid
             return
         if is_allowlisted(domain, allowlist, vendor_labels):
             skipped_allow += 1
             return
-        if not args.force and store.seen(domain):
+        if not args.force and (store.seen(domain) or store.seen(key)):
             return
         candidates[domain] = Candidate(source=source, urlscan_uuid=uuid)
+        chosen[key] = domain
 
     if not args.no_ct:
         all_terms = list(cfg.get("ct_query_terms") or cfg["ct_keywords"])
@@ -2160,7 +2194,17 @@ def run_once(args, cfg: Dict, store: Store, api: requests.Session,
     elif attempted and not any(h.yielded for h in active):
         log.warning("no source returned any domain this pass")
 
-    log.info("new candidates: %d", len(candidates))
+    total = len(candidates)
+    log.info("new candidates: %d", total)
+    if total and not args.no_fingerprint:
+        # A pass that goes quiet for twenty minutes looks broken. Say up front
+        # how long it will take and that the answers come at the end.
+        estimate = total * (args.delay + 2.0)
+        log.info("checking %d pages, roughly %s - the findings are printed "
+                 "in a summary at the end", total, human_time(estimate))
+        if estimate > 900 and not float(getattr(args, "max_seconds", 0) or 0):
+            log.warning("that is a long pass; add --max-seconds 600 to cap it "
+                        "- anything not reached is picked up next time")
 
     api_key = os.environ.get("URLSCAN_API_KEY", "")
     use_archive = bool(cfg.get("urlscan_use_archive", True)) and bool(api_key)
@@ -2168,6 +2212,7 @@ def run_once(args, cfg: Dict, store: Store, api: requests.Session,
     review = 0
 
     confirmed = 0
+    findings: List[Tuple[str, str, Fingerprint, str]] = []
     started = time.monotonic()
     budget = float(getattr(args, "max_seconds", 0) or 0)
     deferred = 0
@@ -2182,6 +2227,18 @@ def run_once(args, cfg: Dict, store: Store, api: requests.Session,
                      "%d to the next pass", budget, processed, deferred)
             break
         processed += 1
+        if processed % 25 == 0 and not args.no_fingerprint:
+            done = time.monotonic() - started
+            if processed < 50:
+                # Too few samples for an honest estimate. A first tick that
+                # claims 47 minutes and a fourth that claims 15 is worse than
+                # no number at all.
+                log.info("checked %d/%d pages", processed, total)
+            else:
+                left = (total - processed) * (done / processed)
+                log.info("checked %d/%d pages, about %s to go "
+                         "(%d confirmed so far)",
+                         processed, total, human_time(left), confirmed)
         source = cand.source
         if args.no_fingerprint:
             store.upsert(domain, source, "candidate",
@@ -2232,21 +2289,25 @@ def run_once(args, cfg: Dict, store: Store, api: requests.Session,
             review += 1
             store.upsert(domain, source, "review", fp.score,
                          ",".join(fp.phones), ";".join(fp.markers[:12]))
-            if not args.dry_run:
-                write_review_note(domain, fp, source, args.out)
-            else:
+            note = ""
+            if args.dry_run:
                 log.info("[dry-run] would flag %s for review (score %d)",
                          domain, fp.content_score)
+            else:
+                note = write_review_note(domain, fp, source, args.out)
+            findings.append(("review", domain, fp, note))
 
         if should_confirm(fp, cfg):
             confirmed += 1
             store.record_phones(fp.phones, domain)
+            report = ""
             if args.dry_run:
                 log.info("[dry-run] would report %s (score %d, phones %s)",
                          domain, fp.score, fp.phones or "none")
             else:
-                write_reports(api, domain, fp, source, args.out, cfg)
+                report = write_reports(api, domain, fp, source, args.out, cfg)
                 store.mark_reported(domain)
+            findings.append(("confirmed", domain, fp, report))
         else:
             log.debug("below threshold: %s score=%d fetched=%s markers=%s",
                       domain, fp.score, fp.fetched, fp.markers[:5])
@@ -2255,14 +2316,220 @@ def run_once(args, cfg: Dict, store: Store, api: requests.Session,
     if not args.dry_run and not args.no_fingerprint:
         write_ioc_sheet(store, args.out / "iocs_phones.csv")
 
+    notes: List[str] = []
     if not args.no_fingerprint and not use_archive:
         log.warning("no URLSCAN_API_KEY: archived-evidence fallback disabled, so "
                     "candidates whose page is already gone cannot be confirmed")
+        notes.append(
+            "No URLSCAN_API_KEY is set. These pages are usually dead within a "
+            "day, and without a key the tool cannot read the saved copy - so "
+            "it will find far less than it could. A free account at "
+            "urlscan.io gives you a key; then run: export URLSCAN_API_KEY=...")
+    degraded = [h.name for h in healths if not h.skipped and h.degraded]
+    if degraded:
+        notes.append(
+            "These sources were unreliable this pass: " + ", ".join(degraded)
+            + ". That is normal for crt.sh in particular and usually clears "
+              "on its own; it just means this pass saw fewer pages.")
     log.info("pass complete: %d candidates, %d confirmed, %d flagged for "
              "review%s (output in %s)",
              len(candidates), confirmed, review,
              f", {revived} via archived evidence" if revived else "",
              args.out)
+    if not args.no_fingerprint:
+        print_findings(findings, args.out, processed,
+                       time.monotonic() - started, args.dry_run, notes,
+                       deferred)
+
+
+# --------------------------------------------------------------------------
+# telling the operator what happened
+#
+# A pass can look at nine hundred pages and say three useful things. Those
+# three have to be findable without reading a log, opening a database, or
+# knowing what a "content score" is - the person who most needs this tool is
+# not a security engineer.
+# --------------------------------------------------------------------------
+RULE = "=" * 72
+
+
+def script_name() -> str:
+    name = os.path.basename(sys.argv[0] or "")
+    return name if name.endswith(".py") else "scamwatch.py"
+
+
+def human_time(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds} seconds"
+    if seconds < 3600:
+        rest = seconds % 60
+        return f"{seconds // 60} min" + (f" {rest} sec" if rest else "")
+    rest = (seconds % 3600) // 60
+    return f"{seconds // 3600} hr" + (f" {rest} min" if rest else "")
+
+
+def plain_reason(fp: Fingerprint) -> str:
+    """
+    Why this page was flagged, in words anyone can check for themselves.
+
+    The marker names are useful in the report file; on screen they read as
+    jargon, and a reason nobody understands is a reason nobody verifies.
+    """
+    bits: List[str] = []
+    if fp.impersonates:
+        bits.append(f'pretends to be "{fp.impersonates}"')
+    if fp.has_remote_tool:
+        bits.append("tells visitors to install remote-control software")
+    if fp.fabricated_detection:
+        bits.append("shows a fake virus or security warning")
+    if fp.phones:
+        bits.append("pushes a phone number to call")
+    if not bits:
+        bits.append("matched " + ", ".join(fp.markers[:3]))
+    return "; ".join(bits)
+
+
+def plain_corroboration(signals: Sequence[str]) -> str:
+    """
+    Say who else agrees, in words rather than label syntax.
+
+    "backed up by: urlscan:malicious, feed:openphish" is precise and
+    unreadable. The label form stays in the report file, which an abuse desk
+    reads; the screen gets the sentence.
+    """
+    out: List[str] = []
+    for sig in signals:
+        if sig.startswith("feed:"):
+            out.append(f"listed on the {sig.split(':', 1)[1]} phishing feed")
+        elif sig == "urlscan:malicious":
+            out.append("urlscan.io rates it malicious")
+        elif sig.startswith("urlscan:score="):
+            out.append(f"urlscan.io scored it {sig.split('=', 1)[1]}")
+        elif sig.startswith("urlscan:brand="):
+            out.append(f"urlscan.io saw it imitating {sig.split('=', 1)[1]}")
+        elif sig.startswith("urlscan:tag="):
+            out.append(f"urlscan.io tagged it {sig.split('=', 1)[1]}")
+        else:
+            out.append(sig)
+    return "; ".join(out) or "n/a"
+
+
+def urlscan_link(domain: str) -> str:
+    return ("https://urlscan.io/search/#page.domain%3A%22"
+            + requests.utils.quote(domain) + "%22")
+
+
+def _field(label: str, text: str, width: int = 54) -> None:
+    """One `label : value` line, wrapped under a hanging indent."""
+    lines = textwrap.wrap(text, width) or [""]
+    print(f"     {label}: {lines[0]}")
+    for line in lines[1:]:
+        print(f"     {' ' * len(label)}  {line}")
+
+
+def print_findings(findings: Sequence[Tuple[str, str, Fingerprint, str]],
+                   outdir: Path, checked: int, elapsed: float,
+                   dry_run: bool = False, warnings: Sequence[str] = (),
+                   deferred: int = 0) -> None:
+    """The end-of-pass summary. Goes to stdout so logs on stderr stay separate."""
+    n_conf = sum(1 for f in findings if f[0] == "confirmed")
+    n_rev = len(findings) - n_conf
+
+    print()
+    print(RULE)
+    print(f"  RESULTS   {n_conf} confirmed   {n_rev} needing a look")
+    print(f"  {checked} page{'' if checked == 1 else 's'} checked "
+          f"in {human_time(elapsed)}")
+    if deferred:
+        print(f"  {deferred} more were queued but not reached - they are not "
+              f"lost,")
+        print("  the next pass picks them up where this one stopped")
+    print(RULE)
+
+    for warning in warnings:
+        print()
+        for line in textwrap.wrap(warning, 68):
+            print(f"  ! {line}")
+
+    if not findings:
+        print()
+        print("  Nothing matched this pass, which is the normal result - most")
+        print("  passes find nothing. Leave it running with --loop and it will")
+        print("  tell you when something turns up.")
+        print()
+        return
+
+    for i, (tier, domain, fp, filename) in enumerate(findings, 1):
+        label = "CONFIRMED" if tier == "confirmed" else "NEEDS A LOOK"
+        print()
+        print(f"  {i}. [{label}]  {domain}")
+        _field("page says   ", fp.title or "(no title)")
+        _field("why flagged ", plain_reason(fp))
+        _field("phone number", ", ".join(fp.phones) or "(none found)")
+        if tier == "confirmed":
+            _field("backed up by", plain_corroboration(fp.corroboration))
+        else:
+            _field("backed up by",
+                   "nobody yet - this is a lead, not a verdict")
+        if filename:
+            print(f"     read this   : {outdir / filename}")
+        elif dry_run:
+            print("     read this   : (nothing written - this was a --dry-run)")
+        print(f"     check it    : {urlscan_link(domain)}")
+
+    print()
+    print(RULE)
+    print("  WHAT TO DO NOW")
+    print(RULE)
+    step = 1
+    if n_conf:
+        print(f"  {step}. Open the .md file listed above and read it.")
+        step += 1
+        print(f"  {step}. Look at the page yourself using the check-it link.")
+        step += 1
+        print(f"  {step}. If you agree it is a scam, open the .eml file next to")
+        print("     the report in your email program and send it. It is already")
+        print("     addressed to the right abuse desk.")
+        step += 1
+        print()
+        print("  This tool never emails anyone. Nothing leaves your machine")
+        print("  until you press send.")
+    if n_rev:
+        if n_conf:
+            print()
+        print(f"  {step}. Items marked NEEDS A LOOK are in {outdir / 'review'}.")
+        print("     Nothing else has confirmed them, so there is no email draft.")
+        print("     Most of these are ordinary sites. Read before acting.")
+    print()
+    print(f"  Everything found so far : python3 {script_name()} --list")
+    print(f"  Phone numbers collected : {outdir / 'iocs_phones.csv'}")
+    print(RULE)
+    print()
+
+
+def print_list(store: Store, limit: int) -> None:
+    """Review earlier findings without digging through the output directory."""
+    rows = store.recent_findings(limit)
+    if not rows:
+        print("No findings recorded yet.")
+        print(f"Run a pass first:  python3 {script_name()} --once")
+        return
+    print(f"{len(rows)} finding(s), most recent first:")
+    for row in rows:
+        label = "CONFIRMED" if row["status"] == "confirmed" else "NEEDS A LOOK"
+        print()
+        print(f"  [{label}]  {row['domain']}")
+        _field("first seen  ",
+               row["first_seen"][:19].replace("T", " ") + " UTC")
+        _field("phone number", row["phones"] or "(none found)")
+        _field("what matched",
+               row["notes"].replace(";", ", ") or "(not recorded)")
+        _field("found via   ", row["source"])
+        print(f"     check it    : {urlscan_link(row['domain'])}")
+    print()
+    print("Report files for confirmed findings are in your --out directory")
+    print("(./out by default), named by date and domain.")
 
 
 def print_stats(store: Store) -> None:
@@ -2275,13 +2542,28 @@ def print_stats(store: Store) -> None:
         print("\ntop phone numbers:")
         for row in rows:
             print(f"  {row['phone']:<18} hits={row['hits']:<4} {row['domains'][:60]}")
+    print(f"\nTo see the findings themselves: python3 {script_name()} --list")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="scamwatch",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Watch CT logs and urlscan for fake live-support scam "
-                    "pages and package abuse reports.")
+                    "pages and package abuse reports.",
+        epilog=textwrap.dedent("""\
+            getting started
+              1. get a free key at urlscan.io, then:  export URLSCAN_API_KEY=...
+              2. python3 scamwatch.py --once          run one pass
+              3. read the summary it prints at the end
+              4. python3 scamwatch.py --list          see it again later
+
+            The tool never sends anything. Confirmed findings come with a
+            ready-addressed .eml draft that you read, check, and send yourself.
+
+            A first pass can take twenty minutes. --max-seconds 600 caps it;
+            whatever it does not reach comes back on the next pass.
+            """))
     parser.add_argument("--once", action="store_true",
                         help="run a single pass and exit (default)")
     parser.add_argument("--loop", action="store_true",
@@ -2303,6 +2585,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="reprocess domains already in the database")
     parser.add_argument("--stats", action="store_true",
                         help="print database summary and exit")
+    parser.add_argument("--list", dest="list_findings", nargs="?", type=int,
+                        const=25, metavar="N",
+                        help="list what has been found so far (default 25 "
+                             "most recent) and exit")
     parser.add_argument("--export-iocs", type=Path, metavar="PATH",
                         help="write a shareable phone-number indicator sheet "
                              "and exit. Contains only numbers, the domains "
@@ -2328,12 +2614,25 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
 
     logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
+        level=logging.INFO,
         format="%(asctime)s %(levelname)-7s %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S%z")
+        datefmt="%H:%M:%S")
+    # -v means "tell me more about what the watcher is doing", not "show me
+    # every TCP connection urllib3 opens". A 23-minute pass buried its three
+    # findings under thousands of connection lines.
+    log.setLevel(logging.DEBUG if args.verbose else logging.INFO)
+    for noisy in ("urllib3", "requests", "chardet", "charset_normalizer"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     args.db.parent.mkdir(parents=True, exist_ok=True)
     store = Store(args.db)
+
+    if args.list_findings:
+        try:
+            print_list(store, args.list_findings)
+        finally:
+            store.close()
+        return 0
 
     if args.stats:
         try:

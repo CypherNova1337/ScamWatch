@@ -34,13 +34,40 @@ Python 3.9+. The only dependency is `requests`.
 ## Run
 
 ```bash
-python3 scamwatch.py --once -v                 # a single pass
+python3 scamwatch.py --once                    # a single pass
+python3 scamwatch.py --list                    # everything found so far
 python3 scamwatch.py --loop                    # leave it running
-python3 scamwatch.py --dry-run -v              # detect and score, write nothing
+python3 scamwatch.py --dry-run                 # detect and score, write nothing
 python3 scamwatch.py --no-fingerprint --loop   # fully passive, no GETs at all
 python3 scamwatch.py --stats                   # what the database knows
 python3 scamwatch.py --export-iocs iocs.csv    # shareable indicator sheet
 ```
+
+You do not have to read the log. Every pass ends with a plain-English summary
+of what it found, why, and what to do about it:
+
+```
+========================================================================
+  RESULTS   1 confirmed   0 needing a look
+  881 pages checked in 23 min 2 sec
+========================================================================
+
+  1. [CONFIRMED]  supp0rt-assistance.vercel.app
+     page says   : Apple-Support assistance
+     why flagged : pretends to be "Apple"; tells visitors to install
+                   remote-control software
+     phone number: +18888422171
+     backed up by: urlscan:malicious
+     read this   : out/20260901T101500Z_supp0rt-assistance.vercel.app.md
+     check it    : https://urlscan.io/search/#page.domain%3A%22...%22
+```
+
+Then it tells you the three steps: read the report, look at the page
+yourself, and if you agree, send the pre-addressed `.eml`. Nothing is ever
+sent for you.
+
+Passes on a cold database can take twenty minutes or more. `--max-seconds 600`
+caps one; whatever it does not reach comes back next pass.
 
 **Set `URLSCAN_API_KEY`.** A free account key is enough. Without one, the
 archived-evidence fallback is disabled — and since most scam pages are dead
@@ -62,6 +89,9 @@ Findings land in one of two tiers:
 
 Plus `scamwatch.csv` (campaign timeline) and `iocs_phones.csv` — every number
 seen, when, and on which domains. That last file is the one worth sharing.
+
+`--list` replays past findings from the database, so you never have to go
+digging through the output directory to remember what turned up.
 
 ## The rules it will not break
 
