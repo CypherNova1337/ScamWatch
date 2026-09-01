@@ -1159,6 +1159,47 @@ class TestSoakRegressions(unittest.TestCase):
         self.assertEqual(len(self.store.unseen_feed_hosts({"anydesk"}, 7)), 7)
 
 
+class TestIocExport(unittest.TestCase):
+    """The shareable sheet is the mechanism behind cross-operator correlation."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.store = sw.Store(self.dir / "t.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_exports_numbers_with_their_domains(self):
+        self.store.record_phones(["+18884536259"], "a.sbs")
+        self.store.record_phones(["+18884536259"], "b.sbs")
+        self.store.record_phones(["+18885550199"], "c.sbs")
+        out = self.dir / "iocs.csv"
+        self.assertEqual(sw.export_iocs(self.store, out), 2)
+        import csv as csv_mod
+        with out.open(encoding="utf-8", newline="") as fh:
+            rows = list(csv_mod.DictReader(fh))
+        by_phone = {r["phone"]: r for r in rows}
+        self.assertEqual(by_phone["+18884536259"]["domain_count"], "2")
+        self.assertEqual(sorted(by_phone["+18884536259"]["domains"].split()),
+                         ["a.sbs", "b.sbs"])
+
+    def test_export_carries_nothing_local_or_sensitive(self):
+        self.store.record_phones(["+18884536259"], "a.sbs")
+        out = self.dir / "iocs.csv"
+        sw.export_iocs(self.store, out)
+        text = out.read_text()
+        self.assertNotIn(str(self.dir), text)
+        self.assertEqual(text.splitlines()[0],
+                         "phone,first_seen,last_seen,domain_count,domains")
+
+    def test_empty_database_exports_a_header_only(self):
+        out = self.dir / "iocs.csv"
+        self.assertEqual(sw.export_iocs(self.store, out), 0)
+        self.assertEqual(len(out.read_text().strip().splitlines()), 1)
+
+
 class TestStoreMeta(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
