@@ -1,6 +1,6 @@
 # ScamWatch
 
-A single-file watcher for fake "live support" / screen-sharing scam landing
+A single-file watcher for fake live support / screen-sharing scam landing
 pages — the tech-support fraud ecosystem.
 
 It fights the operation on the axis that actually costs them: burning domains
