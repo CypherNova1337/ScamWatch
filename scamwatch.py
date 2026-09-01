@@ -2229,9 +2229,16 @@ def run_once(args, cfg: Dict, store: Store, api: requests.Session,
         processed += 1
         if processed % 25 == 0 and not args.no_fingerprint:
             done = time.monotonic() - started
-            left = (total - processed) * (done / processed)
-            log.info("checked %d/%d pages, about %s to go (%d confirmed so far)",
-                     processed, total, human_time(left), confirmed)
+            if processed < 50:
+                # Too few samples for an honest estimate. A first tick that
+                # claims 47 minutes and a fourth that claims 15 is worse than
+                # no number at all.
+                log.info("checked %d/%d pages", processed, total)
+            else:
+                left = (total - processed) * (done / processed)
+                log.info("checked %d/%d pages, about %s to go "
+                         "(%d confirmed so far)",
+                         processed, total, human_time(left), confirmed)
         source = cand.source
         if args.no_fingerprint:
             store.upsert(domain, source, "candidate",
@@ -2331,7 +2338,8 @@ def run_once(args, cfg: Dict, store: Store, api: requests.Session,
              args.out)
     if not args.no_fingerprint:
         print_findings(findings, args.out, processed,
-                       time.monotonic() - started, args.dry_run, notes)
+                       time.monotonic() - started, args.dry_run, notes,
+                       deferred)
 
 
 # --------------------------------------------------------------------------
@@ -2422,7 +2430,8 @@ def _field(label: str, text: str, width: int = 54) -> None:
 
 def print_findings(findings: Sequence[Tuple[str, str, Fingerprint, str]],
                    outdir: Path, checked: int, elapsed: float,
-                   dry_run: bool = False, warnings: Sequence[str] = ()) -> None:
+                   dry_run: bool = False, warnings: Sequence[str] = (),
+                   deferred: int = 0) -> None:
     """The end-of-pass summary. Goes to stdout so logs on stderr stay separate."""
     n_conf = sum(1 for f in findings if f[0] == "confirmed")
     n_rev = len(findings) - n_conf
@@ -2432,6 +2441,10 @@ def print_findings(findings: Sequence[Tuple[str, str, Fingerprint, str]],
     print(f"  RESULTS   {n_conf} confirmed   {n_rev} needing a look")
     print(f"  {checked} page{'' if checked == 1 else 's'} checked "
           f"in {human_time(elapsed)}")
+    if deferred:
+        print(f"  {deferred} more were queued but not reached - they are not "
+              f"lost,")
+        print("  the next pass picks them up where this one stopped")
     print(RULE)
 
     for warning in warnings:

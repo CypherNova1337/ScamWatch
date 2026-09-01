@@ -1660,6 +1660,19 @@ class TestFindingsSummary(unittest.TestCase):
         self.assertIn(".eml", out)
         self.assertIn("never emails anyone", out)
 
+    def test_unreached_candidates_are_explained_not_just_dropped(self):
+        """
+        A budgeted pass logs "795 candidates" and then reports 256 checked.
+        Without a line accounting for the other 539 that reads as data loss.
+        """
+        out = self._capture([], deferred=539)
+        self.assertIn("539", out)
+        self.assertIn("not lost", out)
+        self.assertIn("next pass", out)
+
+    def test_no_deferral_line_when_the_pass_finished(self):
+        self.assertNotIn("not lost", self._capture([]))
+
     def test_an_empty_pass_says_so_plainly(self):
         out = self._capture([])
         self.assertIn("Nothing matched", out)
