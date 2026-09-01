@@ -398,3 +398,11 @@ malformed vCards, and state handling.
 This is a defensive observation and abuse-reporting tool. It reads public
 sources and fetches public pages. It contains no exploitation capability, and
 it should not grow any.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Use it, fork it, ship it.
+
+If you run it and it flags something legitimate, please open an issue. Every
+false positive found so far came from a human reading the output, never from a
+metric, and that is the failure mode worth hearing about.
