@@ -65,6 +65,7 @@ python3 scamwatch.py --loop --interval 300      # permanent watcher
 python3 scamwatch.py --no-fingerprint --loop    # fully passive, no GETs at all
 python3 scamwatch.py --dry-run -v               # detect and score, write nothing
 python3 scamwatch.py --stats                    # what the database knows so far
+python3 scamwatch.py --export-iocs iocs.csv     # shareable indicator sheet
 ```
 
 **Set `URLSCAN_API_KEY`.** It is documented elsewhere as optional; in practice
@@ -86,6 +87,7 @@ more corpses than evidence, and it warns you when it does.
 | `--limit N` | max results per source query (default 50) |
 | `--delay N` | seconds between candidate fetches (default 0.5) |
 | `--max-seconds N` | wall-clock budget for candidate processing; the rest return next pass |
+| `--export-iocs PATH` | write a shareable phone-number sheet and exit |
 | `--out` / `--db` / `--config` | relocate outputs and state |
 
 ## What comes out
@@ -398,6 +400,32 @@ malformed vCards, and state handling.
 This is a defensive observation and abuse-reporting tool. It reads public
 sources and fetches public pages. It contains no exploitation capability, and
 it should not grow any.
+
+## Where this is going
+
+This is the first component of a larger anti-fraud project, and deliberately
+the narrowest one: watch a single scam category, prove the detection is honest,
+and get the reporting right before widening anything. Domain and phone-number
+intelligence is the foundation the rest is meant to stand on.
+
+Its limits are stated in Limitations above rather than in a footnote, because
+a detection tool that oversells itself is worse than no tool. Recall in
+particular is measured against a handful of confirmed pages — enough to show
+the pipeline works end to end, not enough to claim coverage.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). The most valuable contribution is a
+false positive report — if it flags something legitimate, that is the bug worth
+having. Second most valuable is your indicator sheet:
+
+```bash
+python3 scamwatch.py --export-iocs iocs.csv
+```
+
+Numbers recur across campaigns. One number on two domains in your database and
+three more in someone else's is an operation. The tool never syncs or phones
+home; correlation happens because people choose to publish.
 
 ## License
 

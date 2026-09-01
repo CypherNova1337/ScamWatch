@@ -1,0 +1,28 @@
+name: Missed a scam
+description: A real scam page the tool did not catch
+title: "[MISS] "
+labels: ["recall"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Recall is the least-measured part of this tool. Concrete misses are how
+        that improves.
+  - type: input
+    id: url
+    attributes:
+      label: URL or domain
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: What made it a scam?
+      placeholder: Fake Defender alert, locked the tab, toll-free number, pushed an AnyDesk download.
+    validations:
+      required: true
+  - type: input
+    id: scan
+    attributes:
+      label: A urlscan.io link, if you have one
+      description: Archived evidence outlives the page, which is usually dead within a day.

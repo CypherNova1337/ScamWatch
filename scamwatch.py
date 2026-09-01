@@ -1894,6 +1894,28 @@ def append_csv(path: Path, row: Sequence[str]) -> None:
         writer.writerow(row)
 
 
+def export_iocs(store: Store, path: Path) -> int:
+    """
+    Write a shareable indicator sheet.
+
+    Correlation across operators is what makes this worth running in numbers:
+    one number seen on two domains here and three more on someone else's
+    install is a campaign, not a coincidence. Nothing here is local or
+    sensitive - phone numbers, the domains they appeared on, and dates - so
+    the file is safe to publish as-is.
+    """
+    rows = store.all_phones()
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["phone", "first_seen", "last_seen", "domain_count",
+                         "domains"])
+        for row in rows:
+            domains = [d for d in row["domains"].split(",") if d]
+            writer.writerow([row["phone"], row["first_seen"], row["last_seen"],
+                             len(domains), " ".join(sorted(domains))])
+    return len(rows)
+
+
 def write_ioc_sheet(store: Store, path: Path) -> None:
     """Rewrite the master phone-number IOC sheet from accumulated state."""
     with path.open("w", newline="", encoding="utf-8") as fh:
@@ -2281,6 +2303,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="reprocess domains already in the database")
     parser.add_argument("--stats", action="store_true",
                         help="print database summary and exit")
+    parser.add_argument("--export-iocs", type=Path, metavar="PATH",
+                        help="write a shareable phone-number indicator sheet "
+                             "and exit. Contains only numbers, the domains "
+                             "they appeared on, and dates - safe to publish")
     parser.add_argument("--out", type=Path, default=Path("out"),
                         help="report output directory (default ./out)")
     parser.add_argument("--config", type=Path, default=Path("scamwatch.json"),
@@ -2312,6 +2338,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.stats:
         try:
             print_stats(store)
+        finally:
+            store.close()
+        return 0
+
+    if args.export_iocs:
+        try:
+            args.export_iocs.parent.mkdir(parents=True, exist_ok=True)
+            count = export_iocs(store, args.export_iocs)
+            print(f"wrote {count} phone indicators to {args.export_iocs}")
+            if count:
+                print("Safe to publish: numbers, domains and dates only.")
         finally:
             store.close()
         return 0
