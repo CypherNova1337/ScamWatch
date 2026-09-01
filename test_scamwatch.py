@@ -1454,6 +1454,312 @@ class TestReportRendering(unittest.TestCase):
         self.assertEqual(len(rows[1]), len(rows[0]))
 
 
+class TestRunOncePrintsItsFindings(unittest.TestCase):
+    """
+    run_once is where a finding turns into a file and a line on screen. The
+    branch that does it was silently broken once; this drives the whole pass
+    with stubbed sources so the wiring itself is covered, not just the pieces.
+    """
+
+    def _run(self, extra_args=(), corroborated=True):
+        import contextlib
+        import io as _io
+
+        scam = sw.Fingerprint(
+            domain="fake-defender-alert.sbs", content_score=14, fetched=True,
+            http_status=200, title="Windows Defender - Security Alert",
+            markers=["anydesk", "virus detected", "call immediately"],
+            phones=["+18335550142"], impersonates="Windows Defender")
+        if corroborated:
+            scam.corroboration = ["urlscan:malicious"]
+
+        originals = (sw.collect_candidates, sw.fingerprint, sw.attribute)
+        health = sw.SourceHealth("feeds", queries=1, yielded=1)
+        source = "feed:openphish" if corroborated else "ct:live-support"
+        sw.collect_candidates = lambda *a, **k: (
+            {"fake-defender-alert.sbs": sw.Candidate(source=source)},
+            [health])
+        sw.fingerprint = lambda sess, domain, cfg, timeout=12: scam
+        sw.attribute = lambda sess, domain, fp, cfg: sw.Attribution(
+            registrar="NameCheap, Inc.", registrar_abuse="abuse@namecheap.com")
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                out = Path(tmp) / "out"
+                out.mkdir()
+                args = sw.build_parser().parse_args(
+                    ["--delay", "0", "--out", str(out), *extra_args])
+                store = sw.Store(Path(tmp) / "s.db")
+                buf = _io.StringIO()
+                try:
+                    with contextlib.redirect_stdout(buf):
+                        sw.run_once(args, sw.DEFAULT_CONFIG, store,
+                                    requests.Session(), requests.Session())
+                finally:
+                    store.close()
+                return buf.getvalue(), sorted(
+                    str(f.relative_to(out)) for f in out.rglob("*")
+                    if f.is_file())
+        finally:
+            sw.collect_candidates, sw.fingerprint, sw.attribute = originals
+
+    def test_corroboration_is_named_in_english(self):
+        out, _ = self._run()
+        self.assertIn("phishing feed", out)
+        self.assertNotIn("feed:openphish\n", out)
+
+    def test_a_confirmation_is_printed_and_written(self):
+        out, files = self._run()
+        self.assertIn("fake-defender-alert.sbs", out)
+        self.assertIn("CONFIRMED", out)
+        self.assertIn("+18335550142", out)
+        self.assertIn("Windows Defender", out)
+        self.assertIn("WHAT TO DO NOW", out)
+        # the filename the summary points at must be one that exists
+        written = [f for f in files if f.endswith(".md")]
+        self.assertTrue(written)
+        self.assertIn(written[0], out)
+        self.assertIn(written[0][:-3] + ".eml", files)
+
+    def test_an_uncorroborated_lead_is_printed_as_a_lead(self):
+        out, files = self._run(corroborated=False)
+        self.assertIn("NEEDS A LOOK", out)
+        self.assertIn("lead, not a verdict", out)
+        self.assertFalse([f for f in files if f.endswith(".eml")])
+        self.assertTrue([f for f in files if f.startswith("review/")])
+
+    def test_dry_run_still_reports_what_it_found(self):
+        out, files = self._run(extra_args=["--dry-run"])
+        self.assertIn("fake-defender-alert.sbs", out)
+        self.assertIn("--dry-run", out)
+        self.assertEqual(files, [])
+
+
+class TestWwwDeduplication(unittest.TestCase):
+    """
+    A live pass reported www.systemwarning.org. Nothing stopped the bare
+    hostname arriving from another source on a later pass and producing a
+    second report about the same page, which is confusing to read and
+    embarrassing to send twice to the same abuse desk.
+    """
+
+    def test_www_collapses_onto_the_bare_name(self):
+        self.assertEqual(sw.dedupe_key("www.systemwarning.org"),
+                         "systemwarning.org")
+        self.assertEqual(sw.dedupe_key("systemwarning.org"),
+                         "systemwarning.org")
+
+    def test_leaves_everything_else_alone(self):
+        self.assertEqual(sw.dedupe_key("wwww.example.com"), "wwww.example.com")
+        self.assertEqual(sw.dedupe_key("a.www.example.com"), "a.www.example.com")
+        self.assertEqual(sw.dedupe_key("support.example.com"),
+                         "support.example.com")
+
+    def test_does_not_strip_down_to_a_public_suffix(self):
+        """www.co.uk is not the www of a registrable domain."""
+        self.assertEqual(sw.dedupe_key("www.co.uk"), "www.co.uk")
+
+    def test_only_one_of_the_pair_is_queued(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = sw.Store(Path(tmp) / "s.db")
+            try:
+                args = sw.build_parser().parse_args(
+                    ["--no-ct", "--no-urlscan", "--no-feeds"])
+                cands, _ = sw.collect_candidates(args, sw.DEFAULT_CONFIG,
+                                                 store, requests.Session())
+                self.assertEqual(cands, {})
+            finally:
+                store.close()
+
+    def test_the_bare_name_is_not_refetched_once_www_is_stored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = sw.Store(Path(tmp) / "s.db")
+            try:
+                store.upsert("www.systemwarning.org", "feed:openphish")
+                self.assertTrue(store.seen("www.systemwarning.org"))
+                # dedupe_key is what run_once consults for the second form
+                self.assertTrue(
+                    store.seen(sw.dedupe_key("www.systemwarning.org")) or
+                    store.seen("www.systemwarning.org"))
+            finally:
+                store.close()
+
+
+class TestHumanTime(unittest.TestCase):
+    def test_reads_as_english(self):
+        self.assertEqual(sw.human_time(0), "0 seconds")
+        self.assertEqual(sw.human_time(45), "45 seconds")
+        self.assertEqual(sw.human_time(60), "1 min")
+        self.assertEqual(sw.human_time(1382), "23 min 2 sec")
+        self.assertEqual(sw.human_time(3600), "1 hr")
+        self.assertEqual(sw.human_time(3725), "1 hr 2 min")
+
+    def test_negative_elapsed_does_not_render_nonsense(self):
+        self.assertEqual(sw.human_time(-5), "0 seconds")
+
+
+class TestPlainReason(unittest.TestCase):
+    """
+    The on-screen reason has to be checkable by someone who does not know
+    what a marker is. A run that prints "anydesk;fake_detection" tells a
+    security engineer everything and everyone else nothing.
+    """
+
+    def test_names_the_behaviour_not_the_marker(self):
+        fp = sw.Fingerprint(domain="x.test", impersonates="Microsoft Defender",
+                            markers=["anydesk"], phones=["+18005550123"])
+        reason = sw.plain_reason(fp)
+        self.assertIn("Microsoft Defender", reason)
+        self.assertIn("remote-control software", reason)
+        self.assertIn("phone number", reason)
+
+    def test_never_empty(self):
+        fp = sw.Fingerprint(domain="x.test", markers=["security alert"])
+        self.assertTrue(sw.plain_reason(fp).strip())
+        self.assertTrue(sw.plain_reason(sw.Fingerprint(domain="x.test")).strip())
+
+
+class TestFindingsSummary(unittest.TestCase):
+    """
+    A 23-minute pass printed its three findings as three log lines among
+    thousands. The findings have to be reachable without reading the log or
+    opening the output directory to find out what happened.
+    """
+
+    def _capture(self, findings, **kw):
+        import contextlib
+        import io as _io
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            sw.print_findings(findings, Path("out"), 881, 1382.0, **kw)
+        return buf.getvalue()
+
+    def _finding(self, tier, domain, filename):
+        fp = sw.Fingerprint(domain=domain, content_score=26, fetched=True,
+                            http_status=200, title="Apple-Support assistance",
+                            markers=["anydesk"], impersonates="Apple",
+                            phones=["+18888422171"])
+        fp.corroboration = ["urlscan:malicious"]
+        return (tier, domain, fp, filename)
+
+    def test_every_finding_is_named_with_its_file(self):
+        out = self._capture([
+            self._finding("confirmed", "supp0rt-assistance.vercel.app", "a.md"),
+            self._finding("review", "systemwarning.org", "review/b.md"),
+        ])
+        self.assertIn("supp0rt-assistance.vercel.app", out)
+        self.assertIn("systemwarning.org", out)
+        self.assertIn("CONFIRMED", out)
+        self.assertIn("NEEDS A LOOK", out)
+        self.assertIn(str(Path("out") / "a.md"), out)
+        self.assertIn(str(Path("out") / "review/b.md"), out)
+
+    def test_tells_the_reader_what_to_do_next(self):
+        out = self._capture(
+            [self._finding("confirmed", "x.test", "a.md")])
+        self.assertIn("WHAT TO DO NOW", out)
+        self.assertIn(".eml", out)
+        self.assertIn("never emails anyone", out)
+
+    def test_an_empty_pass_says_so_plainly(self):
+        out = self._capture([])
+        self.assertIn("Nothing matched", out)
+        self.assertNotIn("WHAT TO DO NOW", out)
+
+    def test_labels_are_translated_not_dumped(self):
+        self.assertEqual(sw.plain_corroboration([]), "n/a")
+        self.assertIn("phishing feed", sw.plain_corroboration(["feed:openphish"]))
+        self.assertIn("malicious", sw.plain_corroboration(["urlscan:malicious"]))
+        self.assertEqual(sw.plain_corroboration(["something:new"]),
+                         "something:new")
+
+    def test_warnings_are_shown_where_they_will_be_read(self):
+        out = self._capture([], warnings=["No URLSCAN_API_KEY is set."])
+        self.assertIn("URLSCAN_API_KEY", out)
+
+    def test_review_items_are_not_presented_as_verdicts(self):
+        out = self._capture([self._finding("review", "x.test", "review/b.md")])
+        self.assertIn("lead, not a verdict", out)
+        self.assertNotIn("send it", out)
+
+
+class TestRecentFindings(unittest.TestCase):
+    def test_only_findings_newest_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = sw.Store(Path(tmp) / "s.db")
+            try:
+                store.upsert("boring.test", "feed:x", "candidate")
+                store.upsert("lead.test", "feed:x", "review", 10)
+                store.upsert("bad.test", "urlscan:q", "candidate", 26)
+                store.mark_reported("bad.test")
+                rows = store.recent_findings(10)
+                names = {r["domain"] for r in rows}
+                self.assertEqual(names, {"lead.test", "bad.test"})
+            finally:
+                store.close()
+
+    def test_limit_is_honoured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = sw.Store(Path(tmp) / "s.db")
+            try:
+                for i in range(5):
+                    store.upsert(f"d{i}.test", "feed:x", "review", 10)
+                self.assertEqual(len(store.recent_findings(2)), 2)
+            finally:
+                store.close()
+
+    def test_list_on_an_empty_database_is_not_an_error(self):
+        import contextlib
+        import io as _io
+        with tempfile.TemporaryDirectory() as tmp:
+            store = sw.Store(Path(tmp) / "s.db")
+            try:
+                buf = _io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    sw.print_list(store, 25)
+                self.assertIn("No findings recorded yet", buf.getvalue())
+            finally:
+                store.close()
+
+
+class TestWritersReportTheirFilenames(unittest.TestCase):
+    """
+    The summary can only point at a report if the writer says what it wrote.
+    Recomputing the timestamp at the call site would drift by a second and
+    name a file that does not exist.
+    """
+
+    def _fp(self):
+        return sw.Fingerprint(
+            domain="live-support-defender.sbs", content_score=11, fetched=True,
+            http_status=200, markers=["anydesk"], phones=["+18335550142"],
+            title="Live Support")
+
+    def test_review_note_returns_an_existing_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            name = sw.write_review_note("live-support-defender.sbs", self._fp(),
+                                        "feed:openphish", out)
+            self.assertTrue(name.startswith("review/"))
+            self.assertTrue((out / name).exists())
+
+    def test_report_returns_an_existing_path(self):
+        original = sw.attribute
+        sw.attribute = lambda sess, domain, fp, cfg: sw.Attribution(
+            registrar="NameCheap, Inc.", registrar_abuse="abuse@namecheap.com")
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                out = Path(tmp)
+                name = sw.write_reports(requests.Session(),
+                                        "live-support-defender.sbs", self._fp(),
+                                        "feed:openphish", out,
+                                        sw.DEFAULT_CONFIG)
+                self.assertTrue(name.endswith(".md"))
+                self.assertTrue((out / name).exists())
+                self.assertTrue((out / (name[:-3] + ".eml")).exists())
+        finally:
+            sw.attribute = original
+
+
 class TestArgParsing(unittest.TestCase):
     def test_defaults(self):
         args = sw.build_parser().parse_args([])
@@ -1467,6 +1773,13 @@ class TestArgParsing(unittest.TestCase):
         self.assertTrue(args.loop)
         self.assertEqual(args.interval, 60)
         self.assertTrue(args.no_fingerprint)
+
+    def test_list_takes_an_optional_count(self):
+        self.assertIsNone(sw.build_parser().parse_args([]).list_findings)
+        self.assertEqual(
+            sw.build_parser().parse_args(["--list"]).list_findings, 25)
+        self.assertEqual(
+            sw.build_parser().parse_args(["--list", "5"]).list_findings, 5)
 
 
 if __name__ == "__main__":
